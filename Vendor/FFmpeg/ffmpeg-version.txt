@@ -1,0 +1,6 @@
+source=https://github.com/FFmpeg/FFmpeg.git
+ref=n8.0.1
+profile=lgpl
+ios_min=15.0
+tvos_min=15.0
+macos_min=13.0

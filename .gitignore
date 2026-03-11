@@ -33,6 +33,11 @@ playground.xcworkspace
 # .swiftpm
 
 .build/
+.swiftpm/
+
+# FFmpeg vendor build workspace
+.vendor-src/
+.vendor-build/
 
 # CocoaPods
 #

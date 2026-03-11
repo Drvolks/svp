@@ -1,0 +1,4 @@
+module FFmpegBridge [system] {
+    header "CShim.h"
+    export *
+}
