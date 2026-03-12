@@ -24,6 +24,8 @@ public actor PlaybackSession: PlayerEngine {
     private let audioPipeline: any AudioPipeline
     private var playTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
+    private var videoPacketTask: Task<Void, Never>?
+    private var videoPacketContinuation: AsyncStream<DemuxedPacket>.Continuation?
     private var state: PlaybackState = .idle
     private var videoOutputs: [ObjectIdentifier: any VideoOutput] = [:]
     private var audioOutputs: [ObjectIdentifier: any AudioOutput] = [:]
@@ -98,6 +100,7 @@ public actor PlaybackSession: PlayerEngine {
             guard let self else { return }
             await self.monitorForStalls()
         }
+        startVideoPacketLoopIfNeeded()
         playTask = Task { [weak self] in
             guard let self else { return }
             await self.consumePackets()
@@ -209,20 +212,7 @@ public actor PlaybackSession: PlayerEngine {
                 }
                 switch packet.formatHint {
                 case .h264, .hevc:
-                    if let frame = try await videoPipeline.decode(packet: packet) {
-                        guard frame.pixelBuffer != nil else {
-                            throw PlaybackSessionError.renderOutputMissing
-                        }
-                        try await paceVideoIfNeeded(framePTS: frame.pts)
-                        if !loggedFirstVideoFrame {
-                            loggedFirstVideoFrame = true
-                            diagnostics.log("first_video_frame pts=\(frame.pts.seconds)")
-                        }
-                        diagnostics.markFirstFrameRendered()
-                        for output in videoOutputs.values {
-                            output.render(frame: frame)
-                        }
-                    }
+                    enqueueVideoPacket(packet)
                 case .aac, .ac3, .eac3, .opus:
                     if let frame = try await audioPipeline.decode(packet: packet) {
                         if !loggedFirstAudioFrame {
@@ -338,6 +328,56 @@ public actor PlaybackSession: PlayerEngine {
         playTask = nil
         watchdogTask?.cancel()
         watchdogTask = nil
+        videoPacketContinuation?.finish()
+        videoPacketContinuation = nil
+        videoPacketTask?.cancel()
+        videoPacketTask = nil
+    }
+
+    private func startVideoPacketLoopIfNeeded() {
+        guard videoPacketTask == nil else { return }
+        // Do not drop compressed video packets: dropping inter-frames causes visible artifacts.
+        let stream = AsyncStream<DemuxedPacket>(bufferingPolicy: .unbounded) { continuation in
+            self.videoPacketContinuation = continuation
+        }
+        videoPacketTask = Task { [weak self] in
+            guard let self else { return }
+            await self.consumeVideoPackets(stream: stream)
+        }
+    }
+
+    private func enqueueVideoPacket(_ packet: DemuxedPacket) {
+        videoPacketContinuation?.yield(packet)
+    }
+
+    private func consumeVideoPackets(stream: AsyncStream<DemuxedPacket>) async {
+        do {
+            for await packet in stream {
+                if Task.isCancelled { return }
+                if let frame = try await videoPipeline.decode(packet: packet) {
+                    guard frame.pixelBuffer != nil else {
+                        throw PlaybackSessionError.renderOutputMissing
+                    }
+                    try await paceVideoIfNeeded(framePTS: frame.pts)
+                    if !loggedFirstVideoFrame {
+                        loggedFirstVideoFrame = true
+                        diagnostics.log("first_video_frame pts=\(frame.pts.seconds)")
+                    }
+                    diagnostics.markFirstFrameRendered()
+                    for output in videoOutputs.values {
+                        output.render(frame: frame)
+                    }
+                }
+            }
+        } catch {
+            if Task.isCancelled { return }
+            let playerError = makePlayerError(from: error)
+            let description = describe(playerError)
+            diagnostics.incrementDecodeFailure()
+            diagnostics.log("video_processing_error: \(description)")
+            setState(.failed(description))
+            emitEvent(.error(description))
+        }
     }
 
     private func makePlayerError(from error: Error) -> PlayerError {

@@ -12,6 +12,17 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     private var droppedFrames = 0
     private var loggedFirstRender = false
     private var scheduledFrames = 0
+    private var underrunCount = 0
+    private var lowWaterHitCount = 0
+    private var queuedBufferSeconds: Double = 0
+    private let baseStartBufferSeconds: Double = 0.650
+    private let maxStartBufferSeconds: Double = 1.200
+    private let startBufferStepOnUnderrun: Double = 0.120
+    private var minStartBufferSeconds: Double = 0.650
+    private let rebufferLowWaterSeconds: Double = 0.080
+    private let lowWaterHitsBeforeRebuffer: Int = 4
+    private let enableActiveRebuffer: Bool = false
+    private var isRebuffering = true
 
     #if canImport(AVFoundation)
     private let engine = AVAudioEngine()
@@ -43,6 +54,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 loggedFirstRender = true
                 #if DEBUG
                 print("[SVP][Audio] first_render pts=\(frame.pts.seconds) sampleRate=\(frame.sampleRate) channels=\(frame.channels) bytes=\(frame.data.count)")
+                print("[SVP][Audio] jitter_buffer start=\(minStartBufferSeconds)s base=\(baseStartBufferSeconds)s max=\(maxStartBufferSeconds)s lowWater=\(rebufferLowWaterSeconds)s lowHits=\(lowWaterHitsBeforeRebuffer)s callback=dataPlayedBack")
                 #endif
             }
             return wantsPlayback
@@ -67,13 +79,18 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 print("[SVP][Audio] engine_started_in_render")
                 #endif
             }
-            if !playerNode.isPlaying {
-                playerNode.play()
-                #if DEBUG
-                print("[SVP][Audio] playerNode_play_in_render")
-                #endif
+            let bufferSeconds = Double(pcmBuffer.frameLength) / format.sampleRate
+            lock.withLock {
+                queuedBufferSeconds += bufferSeconds
             }
-            playerNode.scheduleBuffer(pcmBuffer, completionHandler: nil)
+            playerNode.scheduleBuffer(pcmBuffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                guard let self else { return }
+                self.lock.withLock {
+                    self.queuedBufferSeconds = max(0, self.queuedBufferSeconds - bufferSeconds)
+                }
+            }
+            maybeEnterRebufferIfUnderrun()
+            maybeStartPlaybackIfReady(logContext: "render")
             lock.withLock {
                 scheduledFrames += 1
                 if scheduledFrames == 1 {
@@ -101,6 +118,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     public func handlePlay() {
         lock.withLock {
             wantsPlayback = true
+            isRebuffering = true
         }
         #if DEBUG
         print("[SVP][Audio] handlePlay")
@@ -115,12 +133,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 print("[SVP][Audio] engine_started_in_handlePlay")
                 #endif
             }
-            if !playerNode.isPlaying {
-                playerNode.play()
-                #if DEBUG
-                print("[SVP][Audio] playerNode_play_in_handlePlay")
-                #endif
-            }
+            maybeStartPlaybackIfReady(logContext: "handlePlay")
         } catch {
             #if DEBUG
             print("[SVP][Audio] handlePlay_error \(error.localizedDescription)")
@@ -133,6 +146,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     public func handlePause() {
         lock.withLock {
             wantsPlayback = false
+            isRebuffering = true
         }
         #if DEBUG
         print("[SVP][Audio] handlePause")
@@ -145,6 +159,10 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     public func handleDiscontinuity() {
         lock.withLock {
             wantsPlayback = false
+            queuedBufferSeconds = 0
+            isRebuffering = true
+            minStartBufferSeconds = baseStartBufferSeconds
+            lowWaterHitCount = 0
         }
         #if canImport(AVFoundation)
         playerNode.stop()
@@ -245,21 +263,73 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             if !engine.isRunning {
                 try engine.start()
             }
-            if !playerNode.isPlaying {
-                playerNode.play()
-            }
+            maybeStartPlaybackIfReady(logContext: "engineConfigChange")
         } catch {
             return
         }
+    }
+
+    private func maybeStartPlaybackIfReady(logContext: String) {
+        let state = lock.withLock { (wantsPlayback, queuedBufferSeconds, isRebuffering, minStartBufferSeconds) }
+        let shouldPlay = state.0
+        guard shouldPlay else { return }
+        let queuedSeconds = state.1
+        let rebuffering = state.2
+        let requiredBufferSeconds = state.3
+        guard queuedSeconds >= requiredBufferSeconds else { return }
+        if !playerNode.isPlaying {
+            playerNode.play()
+            lock.withLock {
+                isRebuffering = false
+            }
+            #if DEBUG
+            let reason = rebuffering ? "rebuffer" : "start"
+            print("[SVP][Audio] playerNode_play_in_\(logContext) queued=\(queuedSeconds) target=\(requiredBufferSeconds) reason=\(reason)")
+            #endif
+        }
+    }
+
+    private func maybeEnterRebufferIfUnderrun() {
+        guard enableActiveRebuffer else { return }
+        guard playerNode.isPlaying else { return }
+        let queuedSeconds = lock.withLock { queuedBufferSeconds }
+        let lowWaterState = lock.withLock { () -> (Int, Bool) in
+            if queuedSeconds < rebufferLowWaterSeconds {
+                lowWaterHitCount += 1
+            } else {
+                lowWaterHitCount = 0
+            }
+            return (lowWaterHitCount, lowWaterHitCount >= lowWaterHitsBeforeRebuffer)
+        }
+        guard lowWaterState.1 else { return }
+        playerNode.pause()
+        let state = lock.withLock { () -> (Int, Double) in
+            isRebuffering = true
+            underrunCount += 1
+            minStartBufferSeconds = min(maxStartBufferSeconds, minStartBufferSeconds + startBufferStepOnUnderrun)
+            lowWaterHitCount = 0
+            return (underrunCount, minStartBufferSeconds)
+        }
+        #if DEBUG
+        print("[SVP][Audio] underrun_enter count=\(state.0) queued=\(queuedSeconds) lowHits=\(lowWaterState.0) nextTarget=\(state.1)")
+        #endif
     }
 
     #if canImport(UIKit)
     private func setupAudioSessionIfAvailable() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay, .mixWithOthers])
+            try session.setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay])
+            try session.setPreferredSampleRate(48_000)
+            try session.setPreferredIOBufferDuration(0.023)
             try session.setActive(true)
+            #if DEBUG
+            print("[SVP][Audio] session_config sampleRate=\(session.sampleRate) ioBuffer=\(session.ioBufferDuration)")
+            #endif
         } catch {
+            #if DEBUG
+            print("[SVP][Audio] session_config_failed \(error.localizedDescription)")
+            #endif
             return
         }
     }
@@ -283,9 +353,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 if !engine.isRunning {
                     try engine.start()
                 }
-                if !playerNode.isPlaying {
-                    playerNode.play()
-                }
+                maybeStartPlaybackIfReady(logContext: "interruptionEnd")
             } catch {
                 return
             }
@@ -302,9 +370,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             if !engine.isRunning {
                 try engine.start()
             }
-            if !playerNode.isPlaying {
-                playerNode.play()
-            }
+            maybeStartPlaybackIfReady(logContext: "routeChange")
         } catch {
             return
         }

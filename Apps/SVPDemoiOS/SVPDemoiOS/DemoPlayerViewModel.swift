@@ -10,7 +10,8 @@ import SwiftUI
 
 @MainActor
 final class DemoPlayerViewModel: NSObject, ObservableObject {
-    @Published var urlText = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
+    //@Published var urlText = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
+    @Published var urlText = "http://10.0.0.28:9191/proxy/ts/stream/d68912e4-88c0-4ec9-9e5f-472137888462"
     @Published var statusMessage = "Colle une URL MP4 puis appuie sur Load Video."
     @Published var isLoaded = false
     @Published var isPlaying = false
