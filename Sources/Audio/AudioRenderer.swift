@@ -52,6 +52,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     private var playbackAnchorPTS: CMTime?
     private var playbackAnchorSampleRate: Double?
     private var audioClockQueryCount = 0
+    private var lastDerivedPlaybackPTS: CMTime?
 
     #if canImport(AVFoundation)
     private let engine = AVAudioEngine()
@@ -210,6 +211,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             lowWaterHitCount = 0
             playbackAnchorPTS = nil
             playbackAnchorSampleRate = nil
+            lastDerivedPlaybackPTS = nil
             audioClockQueryCount = 0
         }
         #if canImport(AVFoundation)
@@ -229,16 +231,23 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         guard let anchorPTS = state.0, let sampleRate = state.1, sampleRate > 0 else { return nil }
         guard let nodeTime = playerNode.lastRenderTime,
               let playerTime = playerNode.playerTime(forNodeTime: nodeTime) else {
-            return nil
+            return lock.withLock { lastDerivedPlaybackPTS }
         }
         let elapsedSeconds = Double(playerTime.sampleTime) / sampleRate
         let playedTime = anchorPTS + CMTime(seconds: elapsedSeconds, preferredTimescale: 90_000)
+        let playbackTime = lock.withLock { () -> CMTime in
+            if playedTime.isValid {
+                lastDerivedPlaybackPTS = playedTime
+                return playedTime
+            }
+            return lastDerivedPlaybackPTS ?? playedTime
+        }
         #if DEBUG
         let queryCount = state.3
         if queryCount == 1 || queryCount % 60 == 0 {
             let anchorText = String(format: "%.3f", anchorPTS.seconds)
             let sampleRateText = String(format: "%.1f", playerTime.sampleRate)
-            let derivedText = String(format: "%.3f", playedTime.seconds)
+            let derivedText = String(format: "%.3f", playbackTime.seconds)
             let queuedText = String(format: "%.3f", state.2)
             print(
                 "[SVP][AudioClock] query=\(queryCount) " +
@@ -249,7 +258,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             )
         }
         #endif
-        return playedTime.isValid ? playedTime : nil
+        return playbackTime.isValid ? playbackTime : nil
         #else
         return nil
         #endif

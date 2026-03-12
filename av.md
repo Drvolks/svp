@@ -312,6 +312,25 @@ Résultat attendu:
 
 Statut:
 - En test.
+
+### 22. Cache de la clock audio jouée
+
+Hypothèse:
+- `AVAudioPlayerNode.playerTime(forNodeTime:)` peut être indisponible ponctuellement.
+- Dans ce cas, `PlaybackSession` retombe sur `lastAudioPTS`, ce qui mélange clock jouée et clock décodée.
+- Effet attendu: drift A/V puis rattrapages vidéo irréguliers.
+
+Changement:
+- `AudioRenderer` garde `lastDerivedPlaybackPTS`.
+- Si `playerTime` n'est pas dispo sur une query, on renvoie la dernière valeur valide au lieu de `nil`.
+
+Résultat attendu:
+- Clock audio plus monotone et cohérente.
+- Moins de bascules implicites vers `lastAudioPTS`.
+- Moins de rattrapages vidéo tardifs.
+
+Statut:
+- En test.
 - Le problème n'est plus "l'horloge n'avance pas".
 - Le problème est la politique de présentation qui utilise ou retient cette clock de façon instable.
 
