@@ -34,8 +34,9 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        configurePiP()
+        configureAudioSession()
         pipPlaybackDelegate.updatePausedState(isPaused: true)
+        configurePiP()
         pipPlaybackDelegate.setPlayingHandler = { [weak self] playing in
             guard let self else { return }
             Task {
@@ -43,6 +44,30 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
             }
         }
         refreshPiPPossible()
+    }
+
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        let attempts: [(AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions)] = [
+            (.playback, .moviePlayback, [.allowAirPlay]),
+            (.playback, .moviePlayback, []),
+            (.playback, .default, [])
+        ]
+        for (index, attempt) in attempts.enumerated() {
+            do {
+                try session.setCategory(attempt.0, mode: attempt.1, options: attempt.2)
+                try session.setActive(true)
+                #if DEBUG
+                print("[SVP][Audio] audio_session active=true attempt=\(index + 1) mode=\(attempt.1.rawValue)")
+                #endif
+                return
+            } catch {
+                #if DEBUG
+                let nsError = error as NSError
+                print("[SVP][Audio] audio_session attempt=\(index + 1) failed code=\(nsError.code) desc=\(error.localizedDescription)")
+                #endif
+            }
+        }
     }
 
     deinit {
@@ -230,6 +255,7 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         pipController = controller
+        pipPlaybackDelegate.bind(controller: controller)
         pipPossibleObservation?.invalidate()
         pipPossibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] controller, _ in
             let possible = controller.isPictureInPicturePossible
@@ -371,13 +397,38 @@ extension DemoPlayerViewModel: AVPictureInPictureControllerDelegate {
 
 private final class PiPPlaybackDelegateBridge: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
     private let lock = NSLock()
+    private weak var controller: AVPictureInPictureController?
     private var isPaused = true
     var setPlayingHandler: (@Sendable (Bool) -> Void)?
+
+    func bind(controller: AVPictureInPictureController) {
+        self.controller = controller
+        invalidatePlaybackState()
+    }
 
     func updatePausedState(isPaused: Bool) {
         lock.withLock {
             self.isPaused = isPaused
         }
+        invalidatePlaybackState()
+    }
+
+    private func invalidatePlaybackState() {
+        guard #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) else { return }
+        if Thread.isMainThread {
+            invalidatePlaybackStateOnMainThread()
+        } else {
+            performSelector(onMainThread: #selector(invalidatePlaybackStateOnMainThreadObjC), with: nil, waitUntilDone: false)
+        }
+    }
+
+    @objc private func invalidatePlaybackStateOnMainThreadObjC() {
+        invalidatePlaybackStateOnMainThread()
+    }
+
+    private func invalidatePlaybackStateOnMainThread() {
+        guard #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) else { return }
+        controller?.invalidatePlaybackState()
     }
 
     func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
