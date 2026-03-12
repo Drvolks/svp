@@ -110,17 +110,23 @@ public struct DecodedVideoFrame: @unchecked Sendable {
     public let pixelBuffer: CVPixelBuffer?
     public let opaqueDecoderPayload: OpaquePointer?
     public let colorInfo: ColorInfo
+    public let decodeElapsedMs: Double
+    public let enqueuedUptime: TimeInterval?
 
     public init(
         pts: CMTime,
         pixelBuffer: CVPixelBuffer?,
         opaqueDecoderPayload: OpaquePointer? = nil,
-        colorInfo: ColorInfo = .unknown
+        colorInfo: ColorInfo = .unknown,
+        decodeElapsedMs: Double = 0,
+        enqueuedUptime: TimeInterval? = nil
     ) {
         self.pts = pts
         self.pixelBuffer = pixelBuffer
         self.opaqueDecoderPayload = opaqueDecoderPayload
         self.colorInfo = colorInfo
+        self.decodeElapsedMs = decodeElapsedMs
+        self.enqueuedUptime = enqueuedUptime
     }
 }
 
@@ -209,6 +215,14 @@ public protocol VideoOutputLifecycle: AnyObject, Sendable {
 
 public protocol AudioOutput: AnyObject, Sendable {
     func render(frame: DecodedAudioFrame)
+}
+
+public protocol AudioPlaybackClockProviding: AnyObject, Sendable {
+    func currentPlaybackTime() -> CMTime?
+}
+
+public protocol AudioOutputSourceConfigurable: AnyObject, Sendable {
+    func configure(for descriptor: MediaSourceDescriptor)
 }
 
 public protocol AudioOutputLifecycle: AnyObject, Sendable {

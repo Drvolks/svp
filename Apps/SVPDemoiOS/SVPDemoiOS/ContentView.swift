@@ -12,6 +12,13 @@ struct ContentView: View {
                 .disableAutocorrection(true)
                 .textFieldStyle(.roundedBorder)
 
+            Picker("Renderer", selection: $viewModel.fullscreenRendererMode) {
+                ForEach(DemoPlayerViewModel.FullscreenRendererMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
             HStack(spacing: 8) {
                 Button("Load Video") {
                     Task { await viewModel.loadVideo() }
@@ -50,8 +57,13 @@ private struct FullscreenPlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            PlayerSurfaceView(renderer: viewModel.renderer)
-                .ignoresSafeArea()
+            if viewModel.fullscreenRendererMode == .metal {
+                PlayerSurfaceView(renderer: viewModel.renderer)
+                    .ignoresSafeArea()
+            } else {
+                PiPLayerHostView(pipLayer: viewModel.sampleBufferOutputLayer(), onAttached: nil)
+                    .ignoresSafeArea()
+            }
             PiPLayerHostView(pipLayer: viewModel.pipOutputLayer(), onAttached: {
                 viewModel.logPiPHostAttached()
             })

@@ -3,7 +3,7 @@ import Foundation
 import PlayerCore
 
 public protocol AudioDecoder: Sendable {
-    func decode(_ packet: DemuxedPacket) async throws -> DecodedAudioFrame?
+    func decode(_ packet: DemuxedPacket) async throws -> [DecodedAudioFrame]
     func flush() async
 }
 
@@ -27,7 +27,7 @@ public actor DefaultAudioPipeline: PlayerCore.AudioPipeline {
         self.decoder = decoder
     }
 
-    public func decode(packet: DemuxedPacket) async throws -> DecodedAudioFrame? {
+    public func decode(packet: DemuxedPacket) async throws -> [DecodedAudioFrame] {
         try await decoder.decode(packet)
     }
 

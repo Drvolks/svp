@@ -42,6 +42,9 @@ struct svp_ffmpeg_audio_decoder {
     int out_sample_rate;
     enum AVSampleFormat out_format;
     AVChannelLayout out_ch_layout;
+    uint8_t *pending_packet_data;
+    int32_t pending_packet_length;
+    int64_t pending_packet_pts90k;
 };
 #endif
 
@@ -594,6 +597,10 @@ static void free_audio_decoder(struct svp_ffmpeg_audio_decoder *decoder) {
     if (decoder == NULL) {
         return;
     }
+    if (decoder->pending_packet_data != NULL) {
+        free(decoder->pending_packet_data);
+        decoder->pending_packet_data = NULL;
+    }
     if (decoder->swr_ctx != NULL) {
         swr_free(&decoder->swr_ctx);
     }
@@ -608,141 +615,55 @@ static void free_audio_decoder(struct svp_ffmpeg_audio_decoder *decoder) {
 }
 #endif
 
-void *svp_ffmpeg_audio_decoder_create(int32_t codecID) {
 #if SVP_HAS_VENDOR_FFMPEG
-    const int ffCodecID = map_codec_id(codecID);
-    const AVCodec *codec;
-    struct svp_ffmpeg_audio_decoder *decoder;
-
-    if (ffCodecID == AV_CODEC_ID_NONE) {
-        return NULL;
-    }
-    codec = avcodec_find_decoder(ffCodecID);
-    if (codec == NULL) {
-        return NULL;
-    }
-
-    decoder = (struct svp_ffmpeg_audio_decoder *)calloc(1, sizeof(struct svp_ffmpeg_audio_decoder));
+static void clear_pending_audio_packet(struct svp_ffmpeg_audio_decoder *decoder) {
     if (decoder == NULL) {
-        return NULL;
-    }
-    decoder->codec_id = ffCodecID;
-    decoder->codec_ctx = avcodec_alloc_context3(codec);
-    if (decoder->codec_ctx == NULL) {
-        free_audio_decoder(decoder);
-        return NULL;
-    }
-    if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
-        free_audio_decoder(decoder);
-        return NULL;
-    }
-    decoder->frame = av_frame_alloc();
-    if (decoder->frame == NULL) {
-        free_audio_decoder(decoder);
-        return NULL;
-    }
-
-    decoder->out_format = AV_SAMPLE_FMT_S16;
-    decoder->out_sample_rate = decoder->codec_ctx->sample_rate > 0 ? decoder->codec_ctx->sample_rate : 48000;
-    av_channel_layout_default(
-        &decoder->out_ch_layout,
-        preferred_output_channels(decoder->codec_ctx->ch_layout.nb_channels)
-    );
-    return decoder;
-#else
-    (void)codecID;
-    return NULL;
-#endif
-}
-
-void svp_ffmpeg_audio_decoder_destroy(void *decoderHandle) {
-#if SVP_HAS_VENDOR_FFMPEG
-    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
-    free_audio_decoder(decoder);
-#else
-    (void)decoderHandle;
-#endif
-}
-
-int32_t svp_ffmpeg_audio_decoder_flush(void *decoderHandle) {
-#if SVP_HAS_VENDOR_FFMPEG
-    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
-    if (decoder == NULL || decoder->codec_ctx == NULL) {
-        return -1;
-    }
-    avcodec_flush_buffers(decoder->codec_ctx);
-    return 0;
-#else
-    (void)decoderHandle;
-    return -38;
-#endif
-}
-
-void svp_ffmpeg_decoded_audio_frame_release(svp_ffmpeg_decoded_audio_frame_t *frame) {
-    if (frame == NULL) {
         return;
     }
-    if (frame->data != NULL) {
-        free(frame->data);
-        frame->data = NULL;
+    if (decoder->pending_packet_data != NULL) {
+        free(decoder->pending_packet_data);
+        decoder->pending_packet_data = NULL;
     }
-    frame->sampleRate = 0;
-    frame->channels = 0;
-    frame->bytesPerSample = 0;
-    frame->pts90k = 0;
-    frame->size = 0;
+    decoder->pending_packet_length = 0;
+    decoder->pending_packet_pts90k = 0;
 }
 
-int32_t svp_ffmpeg_audio_decoder_decode(
-    void *decoderHandle,
+static int32_t stash_pending_audio_packet(
+    struct svp_ffmpeg_audio_decoder *decoder,
     const uint8_t *data,
     int32_t length,
-    int64_t pts90k,
+    int64_t pts90k
+) {
+    uint8_t *copy;
+
+    if (decoder == NULL || data == NULL || length <= 0) {
+        return -1;
+    }
+
+    clear_pending_audio_packet(decoder);
+    copy = (uint8_t *)malloc((size_t)length);
+    if (copy == NULL) {
+        return -12;
+    }
+    memcpy(copy, data, (size_t)length);
+    decoder->pending_packet_data = copy;
+    decoder->pending_packet_length = length;
+    decoder->pending_packet_pts90k = pts90k;
+    return 0;
+}
+
+static int32_t fill_decoded_audio_frame(
+    struct svp_ffmpeg_audio_decoder *decoder,
     svp_ffmpeg_decoded_audio_frame_t *outFrame
 ) {
-#if SVP_HAS_VENDOR_FFMPEG
-    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
-    AVPacket *packet;
-    int sendStatus;
-    int receiveStatus;
     int outChannels;
     int outSamples;
     int outLineSize = 0;
     uint8_t *outData = NULL;
     int convertedSamples;
 
-    if (decoder == NULL || decoder->codec_ctx == NULL || decoder->frame == NULL || outFrame == NULL) {
+    if (decoder == NULL || decoder->frame == NULL || outFrame == NULL) {
         return -1;
-    }
-    if (data == NULL || length <= 0) {
-        return -2;
-    }
-    memset(outFrame, 0, sizeof(*outFrame));
-
-    packet = av_packet_alloc();
-    if (packet == NULL) {
-        return -3;
-    }
-    if (av_new_packet(packet, length) < 0) {
-        av_packet_free(&packet);
-        return -4;
-    }
-    memcpy(packet->data, data, (size_t)length);
-    packet->pts = pts90k;
-    packet->dts = pts90k;
-
-    sendStatus = avcodec_send_packet(decoder->codec_ctx, packet);
-    av_packet_free(&packet);
-    if (sendStatus < 0) {
-        return sendStatus;
-    }
-
-    receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
-    if (receiveStatus == AVERROR(EAGAIN) || receiveStatus == AVERROR_EOF) {
-        return 0;
-    }
-    if (receiveStatus < 0) {
-        return receiveStatus;
     }
 
     if (decoder->frame->sample_rate > 0) {
@@ -809,7 +730,7 @@ int32_t svp_ffmpeg_audio_decoder_decode(
         return -9;
     }
     memcpy(outFrame->data, outData, (size_t)outFrame->size);
-    outFrame->pts90k = pts90k;
+    outFrame->pts90k = 0;
     if (decoder->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
         outFrame->pts90k = decoder->frame->best_effort_timestamp;
     }
@@ -817,11 +738,258 @@ int32_t svp_ffmpeg_audio_decoder_decode(
     av_freep(&outData);
     av_frame_unref(decoder->frame);
     return 1;
+}
+
+static int32_t send_audio_packet(
+    struct svp_ffmpeg_audio_decoder *decoder,
+    const uint8_t *data,
+    int32_t length,
+    int64_t pts90k
+) {
+    AVPacket *packet;
+    int sendStatus;
+
+    if (decoder == NULL || decoder->codec_ctx == NULL || data == NULL || length <= 0) {
+        return -1;
+    }
+
+    packet = av_packet_alloc();
+    if (packet == NULL) {
+        return -3;
+    }
+    if (av_new_packet(packet, length) < 0) {
+        av_packet_free(&packet);
+        return -4;
+    }
+    memcpy(packet->data, data, (size_t)length);
+    packet->pts = pts90k;
+    packet->dts = pts90k;
+
+    sendStatus = avcodec_send_packet(decoder->codec_ctx, packet);
+    av_packet_free(&packet);
+    return sendStatus;
+}
+#endif
+
+void *svp_ffmpeg_audio_decoder_create(int32_t codecID) {
+#if SVP_HAS_VENDOR_FFMPEG
+    const int ffCodecID = map_codec_id(codecID);
+    const AVCodec *codec;
+    struct svp_ffmpeg_audio_decoder *decoder;
+
+    if (ffCodecID == AV_CODEC_ID_NONE) {
+        return NULL;
+    }
+    codec = avcodec_find_decoder(ffCodecID);
+    if (codec == NULL) {
+        return NULL;
+    }
+
+    decoder = (struct svp_ffmpeg_audio_decoder *)calloc(1, sizeof(struct svp_ffmpeg_audio_decoder));
+    if (decoder == NULL) {
+        return NULL;
+    }
+    decoder->codec_id = ffCodecID;
+    decoder->codec_ctx = avcodec_alloc_context3(codec);
+    if (decoder->codec_ctx == NULL) {
+        free_audio_decoder(decoder);
+        return NULL;
+    }
+    if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
+        free_audio_decoder(decoder);
+        return NULL;
+    }
+    decoder->frame = av_frame_alloc();
+    if (decoder->frame == NULL) {
+        free_audio_decoder(decoder);
+        return NULL;
+    }
+
+    decoder->out_format = AV_SAMPLE_FMT_S16;
+    decoder->out_sample_rate = decoder->codec_ctx->sample_rate > 0 ? decoder->codec_ctx->sample_rate : 48000;
+    av_channel_layout_default(
+        &decoder->out_ch_layout,
+        preferred_output_channels(decoder->codec_ctx->ch_layout.nb_channels)
+    );
+    return decoder;
+#else
+    (void)codecID;
+    return NULL;
+#endif
+}
+
+void svp_ffmpeg_audio_decoder_destroy(void *decoderHandle) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
+    free_audio_decoder(decoder);
+#else
+    (void)decoderHandle;
+#endif
+}
+
+int32_t svp_ffmpeg_audio_decoder_flush(void *decoderHandle) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
+    if (decoder == NULL || decoder->codec_ctx == NULL) {
+        return -1;
+    }
+    clear_pending_audio_packet(decoder);
+    avcodec_flush_buffers(decoder->codec_ctx);
+    return 0;
+#else
+    (void)decoderHandle;
+    return -38;
+#endif
+}
+
+void svp_ffmpeg_decoded_audio_frame_release(svp_ffmpeg_decoded_audio_frame_t *frame) {
+    if (frame == NULL) {
+        return;
+    }
+    if (frame->data != NULL) {
+        free(frame->data);
+        frame->data = NULL;
+    }
+    frame->sampleRate = 0;
+    frame->channels = 0;
+    frame->bytesPerSample = 0;
+    frame->pts90k = 0;
+    frame->size = 0;
+}
+
+int32_t svp_ffmpeg_audio_decoder_decode(
+    void *decoderHandle,
+    const uint8_t *data,
+    int32_t length,
+    int64_t pts90k,
+    svp_ffmpeg_decoded_audio_frame_t *outFrame
+) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
+    int receiveStatus;
+    int sendStatus;
+    const uint8_t *packetData = data;
+    int32_t packetLength = length;
+    int64_t packetPTS = pts90k;
+
+    if (decoder == NULL || decoder->codec_ctx == NULL || decoder->frame == NULL || outFrame == NULL) {
+        return -1;
+    }
+    memset(outFrame, 0, sizeof(*outFrame));
+
+    receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+    if (receiveStatus >= 0) {
+        if (data != NULL && length > 0) {
+            sendStatus = send_audio_packet(decoder, data, length, pts90k);
+            if (sendStatus == AVERROR(EAGAIN)) {
+                if (stash_pending_audio_packet(decoder, data, length, pts90k) < 0) {
+                    av_frame_unref(decoder->frame);
+                    return -12;
+                }
+            } else if (sendStatus < 0) {
+                av_frame_unref(decoder->frame);
+                return sendStatus;
+            }
+        }
+        return fill_decoded_audio_frame(decoder, outFrame);
+    }
+    if (receiveStatus != AVERROR(EAGAIN) && receiveStatus != AVERROR_EOF) {
+        return receiveStatus;
+    }
+
+    if (decoder->pending_packet_data != NULL) {
+        packetData = decoder->pending_packet_data;
+        packetLength = decoder->pending_packet_length;
+        packetPTS = decoder->pending_packet_pts90k;
+    }
+    if (packetData == NULL || packetLength <= 0) {
+        return 0;
+    }
+
+    sendStatus = send_audio_packet(decoder, packetData, packetLength, packetPTS);
+    if (sendStatus == AVERROR(EAGAIN)) {
+        if (decoder->pending_packet_data == NULL && packetData == data) {
+            if (stash_pending_audio_packet(decoder, data, length, pts90k) < 0) {
+                return -12;
+            }
+        }
+        return sendStatus;
+    }
+    if (sendStatus < 0) {
+        return sendStatus;
+    }
+    if (decoder->pending_packet_data == packetData) {
+        clear_pending_audio_packet(decoder);
+    }
+
+    receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+    if (receiveStatus == AVERROR(EAGAIN) || receiveStatus == AVERROR_EOF) {
+        return 0;
+    }
+    if (receiveStatus < 0) {
+        return receiveStatus;
+    }
+    return fill_decoded_audio_frame(decoder, outFrame);
 #else
     (void)decoderHandle;
     (void)data;
     (void)length;
     (void)pts90k;
+    (void)outFrame;
+    return -38;
+#endif
+}
+
+int32_t svp_ffmpeg_audio_decoder_drain(
+    void *decoderHandle,
+    svp_ffmpeg_decoded_audio_frame_t *outFrame
+) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_audio_decoder *decoder = (struct svp_ffmpeg_audio_decoder *)decoderHandle;
+    int receiveStatus;
+    int sendStatus;
+
+    if (decoder == NULL || decoder->codec_ctx == NULL || decoder->frame == NULL || outFrame == NULL) {
+        return -1;
+    }
+    memset(outFrame, 0, sizeof(*outFrame));
+
+    receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+    if (receiveStatus >= 0) {
+        return fill_decoded_audio_frame(decoder, outFrame);
+    }
+    if (receiveStatus != AVERROR(EAGAIN) && receiveStatus != AVERROR_EOF) {
+        return receiveStatus;
+    }
+
+    if (decoder->pending_packet_data == NULL || decoder->pending_packet_length <= 0) {
+        return 0;
+    }
+
+    sendStatus = send_audio_packet(
+        decoder,
+        decoder->pending_packet_data,
+        decoder->pending_packet_length,
+        decoder->pending_packet_pts90k
+    );
+    if (sendStatus == AVERROR(EAGAIN)) {
+        return 0;
+    }
+    if (sendStatus < 0) {
+        return sendStatus;
+    }
+    clear_pending_audio_packet(decoder);
+
+    receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+    if (receiveStatus == AVERROR(EAGAIN) || receiveStatus == AVERROR_EOF) {
+        return 0;
+    }
+    if (receiveStatus < 0) {
+        return receiveStatus;
+    }
+    return fill_decoded_audio_frame(decoder, outFrame);
+#else
+    (void)decoderHandle;
     (void)outFrame;
     return -38;
 #endif

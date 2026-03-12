@@ -78,6 +78,10 @@ int32_t svp_ffmpeg_audio_decoder_decode(
     int64_t pts90k,
     svp_ffmpeg_decoded_audio_frame_t *outFrame
 );
+int32_t svp_ffmpeg_audio_decoder_drain(
+    void *decoder,
+    svp_ffmpeg_decoded_audio_frame_t *outFrame
+);
 void svp_ffmpeg_decoded_audio_frame_release(svp_ffmpeg_decoded_audio_frame_t *frame);
 
 #endif

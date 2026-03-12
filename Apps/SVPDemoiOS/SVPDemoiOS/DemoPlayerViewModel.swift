@@ -10,8 +10,14 @@ import SwiftUI
 
 @MainActor
 final class DemoPlayerViewModel: NSObject, ObservableObject {
-    //@Published var urlText = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
-    @Published var urlText = "http://10.0.0.28:9191/proxy/ts/stream/d68912e4-88c0-4ec9-9e5f-472137888462"
+    enum FullscreenRendererMode: String, CaseIterable, Identifiable {
+        case metal = "Metal"
+        case sampleBuffer = "Layer"
+
+        var id: String { rawValue }
+    }
+
+    @Published var urlText = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
     @Published var statusMessage = "Colle une URL MP4 puis appuie sur Load Video."
     @Published var isLoaded = false
     @Published var isPlaying = false
@@ -19,9 +25,11 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
     @Published var isPiPPossible = false
     @Published var isEnded = false
     @Published var isFullscreenPresented = false
+    @Published var fullscreenRendererMode: FullscreenRendererMode = .metal
 
     let renderer = MetalRenderer()
     private let pipBridge = PiPBridge()
+    private let sampleBufferBridge = PiPBridge()
     private let pipPlaybackDelegate = PiPPlaybackDelegateBridge()
 
     private var pipController: AVPictureInPictureController?
@@ -86,9 +94,12 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
             await teardownCurrentPlayerIfNeeded()
 
             let source = try makeInputSource(url: url)
-            let newPlayer = Player(source: source, preferHardwareDecode: false)
+            renderer.setFixedPreferredFPS(nil)
+            renderer.setLockEstimatedPreferredFPS(source.descriptor.isLive)
+            let newPlayer = Player(source: source, preferHardwareDecode: true)
             await newPlayer.attachVideoOutput(renderer)
             await newPlayer.attachVideoOutput(pipBridge)
+            await newPlayer.attachVideoOutput(sampleBufferBridge)
 
             let playableSource = PlayableSource(descriptor: source.descriptor)
             try await newPlayer.load(playableSource)
@@ -167,7 +178,25 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
             throw URLError(.unsupportedURL)
         }
+        if isLiveTSURL(url) {
+            return LiveTSInputSource(streamURL: url)
+        }
         return HTTPInputSource(url: url)
+    }
+
+    private func isLiveTSURL(_ url: URL) -> Bool {
+        let path = url.path.lowercased()
+        let ext = url.pathExtension.lowercased()
+        if ext == "ts" || ext == "m2ts" {
+            return true
+        }
+        if path.contains("/proxy/ts/stream/") {
+            return true
+        }
+        if path.contains("/live/") && path.contains("/ts/") {
+            return true
+        }
+        return false
     }
 
     private func setPlayback(playing: Bool) async {
@@ -335,6 +364,10 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
 
     func pipOutputLayer() -> AVSampleBufferDisplayLayer {
         pipBridge.outputLayer()
+    }
+
+    func sampleBufferOutputLayer() -> AVSampleBufferDisplayLayer {
+        sampleBufferBridge.outputLayer()
     }
 
     func logPiPHostAttached() {

@@ -5,7 +5,37 @@ import PlayerCore
 import AVFoundation
 #endif
 
-public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputLifecycle {
+public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputLifecycle, AudioPlaybackClockProviding, AudioOutputSourceConfigurable {
+    private struct PlaybackProfile: Sendable {
+        let mode: String
+        let baseStartBufferSeconds: Double
+        let maxStartBufferSeconds: Double
+        let startBufferStepOnUnderrun: Double
+        let rebufferLowWaterSeconds: Double
+        let lowWaterHitsBeforeRebuffer: Int
+        let maxBufferedAudioSeconds: Double
+
+        static let vod = PlaybackProfile(
+            mode: "vod",
+            baseStartBufferSeconds: 0.650,
+            maxStartBufferSeconds: 1.200,
+            startBufferStepOnUnderrun: 0.120,
+            rebufferLowWaterSeconds: 0.080,
+            lowWaterHitsBeforeRebuffer: 4,
+            maxBufferedAudioSeconds: 2.50
+        )
+
+        static let live = PlaybackProfile(
+            mode: "live",
+            baseStartBufferSeconds: 0.300,
+            maxStartBufferSeconds: 0.750,
+            startBufferStepOnUnderrun: 0.080,
+            rebufferLowWaterSeconds: 0.050,
+            lowWaterHitsBeforeRebuffer: 3,
+            maxBufferedAudioSeconds: 1.400
+        )
+    }
+
     private let lock = NSLock()
     private var renderedFrames = 0
     private var wantsPlayback = false
@@ -15,14 +45,13 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     private var underrunCount = 0
     private var lowWaterHitCount = 0
     private var queuedBufferSeconds: Double = 0
-    private let baseStartBufferSeconds: Double = 0.650
-    private let maxStartBufferSeconds: Double = 1.200
-    private let startBufferStepOnUnderrun: Double = 0.120
+    private var profile = PlaybackProfile.vod
     private var minStartBufferSeconds: Double = 0.650
-    private let rebufferLowWaterSeconds: Double = 0.080
-    private let lowWaterHitsBeforeRebuffer: Int = 4
     private let enableActiveRebuffer: Bool = false
     private var isRebuffering = true
+    private var playbackAnchorPTS: CMTime?
+    private var playbackAnchorSampleRate: Double?
+    private var audioClockQueryCount = 0
 
     #if canImport(AVFoundation)
     private let engine = AVAudioEngine()
@@ -32,6 +61,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     #endif
 
     public init() {
+        minStartBufferSeconds = profile.baseStartBufferSeconds
         #if canImport(AVFoundation)
         engine.attach(playerNode)
         setupAudioSessionIfAvailable()
@@ -54,7 +84,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 loggedFirstRender = true
                 #if DEBUG
                 print("[SVP][Audio] first_render pts=\(frame.pts.seconds) sampleRate=\(frame.sampleRate) channels=\(frame.channels) bytes=\(frame.data.count)")
-                print("[SVP][Audio] jitter_buffer start=\(minStartBufferSeconds)s base=\(baseStartBufferSeconds)s max=\(maxStartBufferSeconds)s lowWater=\(rebufferLowWaterSeconds)s lowHits=\(lowWaterHitsBeforeRebuffer)s callback=dataPlayedBack")
+                print("[SVP][Audio] jitter_buffer mode=\(profile.mode) start=\(minStartBufferSeconds)s base=\(profile.baseStartBufferSeconds)s max=\(profile.maxStartBufferSeconds)s lowWater=\(profile.rebufferLowWaterSeconds)s lowHits=\(profile.lowWaterHitsBeforeRebuffer)s maxBuffered=\(profile.maxBufferedAudioSeconds)s callback=dataPlayedBack")
                 #endif
             }
             return wantsPlayback
@@ -80,8 +110,23 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 #endif
             }
             let bufferSeconds = Double(pcmBuffer.frameLength) / format.sampleRate
-            lock.withLock {
+            let queuedAfterAppend = lock.withLock { () -> Double in
                 queuedBufferSeconds += bufferSeconds
+                if playbackAnchorPTS == nil || playbackAnchorSampleRate == nil {
+                    playbackAnchorPTS = frame.pts
+                    playbackAnchorSampleRate = format.sampleRate
+                }
+                return queuedBufferSeconds
+            }
+            if queuedAfterAppend > profile.maxBufferedAudioSeconds {
+                lock.withLock {
+                    queuedBufferSeconds = max(0, queuedBufferSeconds - bufferSeconds)
+                    droppedFrames += 1
+                }
+                #if DEBUG
+                print("[SVP][Audio] drop_frame reason=queue_overflow queued=\(queuedAfterAppend) max=\(profile.maxBufferedAudioSeconds)")
+                #endif
+                return
             }
             playerNode.scheduleBuffer(pcmBuffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
                 guard let self else { return }
@@ -161,8 +206,11 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             wantsPlayback = false
             queuedBufferSeconds = 0
             isRebuffering = true
-            minStartBufferSeconds = baseStartBufferSeconds
+            minStartBufferSeconds = profile.baseStartBufferSeconds
             lowWaterHitCount = 0
+            playbackAnchorPTS = nil
+            playbackAnchorSampleRate = nil
+            audioClockQueryCount = 0
         }
         #if canImport(AVFoundation)
         playerNode.stop()
@@ -171,6 +219,62 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         }
         #endif
     }
+
+    public func currentPlaybackTime() -> CMTime? {
+        #if canImport(AVFoundation)
+        let state = lock.withLock { () -> (CMTime?, Double?, Double, Int) in
+            audioClockQueryCount += 1
+            return (playbackAnchorPTS, playbackAnchorSampleRate, queuedBufferSeconds, audioClockQueryCount)
+        }
+        guard let anchorPTS = state.0, let sampleRate = state.1, sampleRate > 0 else { return nil }
+        guard let nodeTime = playerNode.lastRenderTime,
+              let playerTime = playerNode.playerTime(forNodeTime: nodeTime) else {
+            return nil
+        }
+        let elapsedSeconds = Double(playerTime.sampleTime) / sampleRate
+        let playedTime = anchorPTS + CMTime(seconds: elapsedSeconds, preferredTimescale: 90_000)
+        #if DEBUG
+        let queryCount = state.3
+        if queryCount == 1 || queryCount % 60 == 0 {
+            let anchorText = String(format: "%.3f", anchorPTS.seconds)
+            let sampleRateText = String(format: "%.1f", playerTime.sampleRate)
+            let derivedText = String(format: "%.3f", playedTime.seconds)
+            let queuedText = String(format: "%.3f", state.2)
+            print(
+                "[SVP][AudioClock] query=\(queryCount) " +
+                "anchorPTS=\(anchorText) " +
+                "sampleTime=\(playerTime.sampleTime) sampleRate=\(sampleRateText) " +
+                "derivedPTS=\(derivedText) " +
+                "queued=\(queuedText)"
+            )
+        }
+        #endif
+        return playedTime.isValid ? playedTime : nil
+        #else
+        return nil
+        #endif
+    }
+
+    public func configure(for descriptor: MediaSourceDescriptor) {
+        let nextProfile: PlaybackProfile = descriptor.isLive ? .live : .vod
+        let changed = lock.withLock { () -> Bool in
+            let changed = profile.mode != nextProfile.mode
+            profile = nextProfile
+            minStartBufferSeconds = nextProfile.baseStartBufferSeconds
+            return changed
+        }
+        #if DEBUG
+        if changed {
+            print(
+                "[SVP][Audio] profile mode=\(nextProfile.mode) " +
+                "base=\(nextProfile.baseStartBufferSeconds) max=\(nextProfile.maxStartBufferSeconds) " +
+                "lowWater=\(nextProfile.rebufferLowWaterSeconds) maxBuffered=\(nextProfile.maxBufferedAudioSeconds)"
+            )
+        }
+        #endif
+    }
+
+
 
     #if canImport(AVFoundation)
     private func configureIfNeeded(for frame: DecodedAudioFrame) throws {
@@ -193,6 +297,10 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         if engine.isRunning {
             playerNode.stop()
             engine.stop()
+        }
+        lock.withLock {
+            playbackAnchorPTS = nil
+            playbackAnchorSampleRate = nil
         }
         engine.disconnectNodeOutput(playerNode)
         engine.connect(playerNode, to: engine.mainMixerNode, format: format)
@@ -294,19 +402,19 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         guard playerNode.isPlaying else { return }
         let queuedSeconds = lock.withLock { queuedBufferSeconds }
         let lowWaterState = lock.withLock { () -> (Int, Bool) in
-            if queuedSeconds < rebufferLowWaterSeconds {
+            if queuedSeconds < profile.rebufferLowWaterSeconds {
                 lowWaterHitCount += 1
             } else {
                 lowWaterHitCount = 0
             }
-            return (lowWaterHitCount, lowWaterHitCount >= lowWaterHitsBeforeRebuffer)
+            return (lowWaterHitCount, lowWaterHitCount >= profile.lowWaterHitsBeforeRebuffer)
         }
         guard lowWaterState.1 else { return }
         playerNode.pause()
         let state = lock.withLock { () -> (Int, Double) in
             isRebuffering = true
             underrunCount += 1
-            minStartBufferSeconds = min(maxStartBufferSeconds, minStartBufferSeconds + startBufferStepOnUnderrun)
+            minStartBufferSeconds = min(profile.maxStartBufferSeconds, minStartBufferSeconds + profile.startBufferStepOnUnderrun)
             lowWaterHitCount = 0
             return (underrunCount, minStartBufferSeconds)
         }

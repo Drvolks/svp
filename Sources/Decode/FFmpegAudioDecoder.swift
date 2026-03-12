@@ -9,7 +9,7 @@ public actor FFmpegAudioDecoder: AudioDecoder {
 
     public init() {}
 
-    public func decode(_ packet: DemuxedPacket) async throws -> DecodedAudioFrame? {
+    public func decode(_ packet: DemuxedPacket) async throws -> [DecodedAudioFrame] {
         guard packet.formatHint == .aac || packet.formatHint == .opus || packet.formatHint == .ac3 || packet.formatHint == .eac3 else {
             throw AudioDecodeError.unsupportedCodec(packet.formatHint)
         }
@@ -23,8 +23,9 @@ public actor FFmpegAudioDecoder: AudioDecoder {
             throw AudioDecodeError.backendUnavailable
         }
 
+        var decodedFrames: [DecodedAudioFrame] = []
         var frame = svp_ffmpeg_decoded_audio_frame_t()
-        let status = packet.data.withUnsafeBytes { bytes in
+        let initialStatus = packet.data.withUnsafeBytes { bytes in
             svp_ffmpeg_audio_decoder_decode(
                 handle,
                 bytes.bindMemory(to: UInt8.self).baseAddress,
@@ -33,23 +34,26 @@ public actor FFmpegAudioDecoder: AudioDecoder {
                 &frame
             )
         }
-        defer { svp_ffmpeg_decoded_audio_frame_release(&frame) }
-
-        if status == 0 {
-            return nil
+        do {
+            try appendDecodedFrame(from: &frame, status: initialStatus, into: &decodedFrames)
+        } catch AudioDecodeError.needMoreData {
+            return decodedFrames
         }
-        if status < 0 {
-            throw AudioDecodeError.decodeFailed(OSStatus(status))
-        }
-        guard frame.size > 0, let dataPtr = frame.data else { return nil }
 
-        let data = Data(bytes: dataPtr, count: Int(frame.size))
-        return DecodedAudioFrame(
-            pts: CMTime(value: frame.pts90k, timescale: 90_000),
-            sampleRate: Double(frame.sampleRate),
-            channels: Int(frame.channels),
-            data: data
-        )
+        while true {
+            var drained = svp_ffmpeg_decoded_audio_frame_t()
+            let drainStatus = svp_ffmpeg_audio_decoder_drain(handle, &drained)
+            do {
+                try appendDecodedFrame(from: &drained, status: drainStatus, into: &decodedFrames)
+            } catch AudioDecodeError.needMoreData {
+                break
+            }
+            if drainStatus == 0 {
+                break
+            }
+        }
+
+        return decodedFrames
     }
 
     public func flush() async {
@@ -83,6 +87,32 @@ public actor FFmpegAudioDecoder: AudioDecoder {
         case .eac3: return 6
         default: return 0
         }
+    }
+
+    private func appendDecodedFrame(
+        from frame: inout svp_ffmpeg_decoded_audio_frame_t,
+        status: Int32,
+        into output: inout [DecodedAudioFrame]
+    ) throws {
+        defer { svp_ffmpeg_decoded_audio_frame_release(&frame) }
+
+        if status == 0 {
+            throw AudioDecodeError.needMoreData
+        }
+        if status < 0 {
+            throw AudioDecodeError.decodeFailed(OSStatus(status))
+        }
+        guard frame.size > 0, let dataPtr = frame.data else { return }
+
+        let data = Data(bytes: dataPtr, count: Int(frame.size))
+        output.append(
+            DecodedAudioFrame(
+                pts: CMTime(value: frame.pts90k, timescale: 90_000),
+                sampleRate: Double(frame.sampleRate),
+                channels: Int(frame.channels),
+                data: data
+            )
+        )
     }
 }
 

@@ -27,6 +27,9 @@ final class TSTransportParser: @unchecked Sendable {
             if remainder[offset] != 0x47 {
                 if let sync = findNextSync(startingAt: offset + 1) {
                     offset = sync
+                    if offset + packetSize > remainder.count {
+                        break
+                    }
                 } else {
                     break
                 }
@@ -176,8 +179,11 @@ final class TSTransportParser: @unchecked Sendable {
             let streamType = section[index]
             let elementaryPID = (UInt16(section[index + 1] & 0x1F) << 8) | UInt16(section[index + 2])
             let esInfoLength = Int((UInt16(section[index + 3] & 0x0F) << 8) | UInt16(section[index + 4]))
+            let descriptorStart = index + 5
+            let descriptorEnd = min(descriptorStart + esInfoLength, endWithoutCRC)
+            let esInfo = descriptorStart < descriptorEnd ? section.subdata(in: descriptorStart..<descriptorEnd) : Data()
 
-            codecsByPID[elementaryPID] = mapCodec(streamType: streamType)
+            codecsByPID[elementaryPID] = mapCodec(streamType: streamType, esInfo: esInfo)
             index += 5 + esInfoLength
         }
     }
@@ -271,15 +277,55 @@ final class TSTransportParser: @unchecked Sendable {
         )
     }
 
-    private func mapCodec(streamType: UInt8) -> CodecID {
+    private func mapCodec(streamType: UInt8, esInfo: Data) -> CodecID {
         switch streamType {
         case 0x1B: return .h264
         case 0x24: return .hevc
         case 0x0F, 0x11: return .aac
         case 0x81: return .ac3
         case 0x87: return .eac3
+        case 0x06:
+            return mapPrivateCodec(from: esInfo)
         default: return .unknown
         }
+    }
+
+    private func mapPrivateCodec(from esInfo: Data) -> CodecID {
+        var index = 0
+        while index + 2 <= esInfo.count {
+            let tag = esInfo[index]
+            let length = Int(esInfo[index + 1])
+            let payloadStart = index + 2
+            let payloadEnd = min(payloadStart + length, esInfo.count)
+            guard payloadStart <= payloadEnd else { break }
+            let payload = esInfo.subdata(in: payloadStart..<payloadEnd)
+
+            switch tag {
+            case 0x6A:
+                return .ac3
+            case 0x7A:
+                return .eac3
+            case 0x7C:
+                return .aac
+            case 0x05:
+                if payload.count >= 4 {
+                    let registration = String(decoding: payload.prefix(4), as: UTF8.self)
+                    switch registration {
+                    case "AC-3":
+                        return .ac3
+                    case "EAC3":
+                        return .eac3
+                    default:
+                        break
+                    }
+                }
+            default:
+                break
+            }
+
+            index = payloadEnd
+        }
+        return .unknown
     }
 
     private func isKeyframe(payload: Data, codec: CodecID) -> Bool {

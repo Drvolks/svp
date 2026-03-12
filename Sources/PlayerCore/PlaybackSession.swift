@@ -13,19 +13,25 @@ public protocol VideoPipeline: Actor {
 }
 
 public protocol AudioPipeline: Actor {
-    func decode(packet: DemuxedPacket) async throws -> DecodedAudioFrame?
+    func decode(packet: DemuxedPacket) async throws -> [DecodedAudioFrame]
     func flush() async
 }
 
 public actor PlaybackSession: PlayerEngine {
     public let clock: MediaClock
+    private let diagnostics = PlaybackDiagnostics()
     private let demuxer: any DemuxEngine
     private let videoPipeline: any VideoPipeline
     private let audioPipeline: any AudioPipeline
-    private var playTask: Task<Void, Never>?
+    private let videoPresenter: VideoPresenter
+    private let audioPacketQueue = PacketQueue(capacity: 256, overflowPolicy: .blockProducer)
+    private let videoPacketQueue = PacketQueue(capacity: 180, overflowPolicy: .preferKeyframes)
+    private let videoFrameQueue = FrameQueue(capacity: 24)
+    private var demuxTask: Task<Void, Never>?
+    private var audioTask: Task<Void, Never>?
+    private var videoDecodeTask: Task<Void, Never>?
+    private var videoPresentTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
-    private var videoPacketTask: Task<Void, Never>?
-    private var videoPacketContinuation: AsyncStream<DemuxedPacket>.Continuation?
     private var state: PlaybackState = .idle
     private var videoOutputs: [ObjectIdentifier: any VideoOutput] = [:]
     private var audioOutputs: [ObjectIdentifier: any AudioOutput] = [:]
@@ -33,14 +39,41 @@ public actor PlaybackSession: PlayerEngine {
     private var lastAudioPTS: CMTime?
     private var lastPacketUptime: TimeInterval = 0
     private let rebufferThreshold: TimeInterval = 0.8
+    private let audioStallLowWaterSeconds: Double = 0.12
+    private let videoFrameStallLowWaterSeconds: Double = 0.20
+    private let videoPacketStallLowWaterSeconds: Double = 0.20
     private var eventContinuations: [UUID: AsyncStream<PlaybackEvent>.Continuation] = [:]
     private var knownDuration: CMTime?
-    private let diagnostics = PlaybackDiagnostics()
+    private var sourceDescriptor: MediaSourceDescriptor?
     private var packetCount: Int = 0
+    private var droppedVideoPackets = 0
+    private var demuxCompleted = false
+    private var audioWorkerFinished = false
+    private var videoDecodeWorkerFinished = false
+    private var videoPresentWorkerFinished = false
+    private var consecutiveVideoDecodeFailures = 0
+    private var waitingForVideoKeyframeResync = false
     private var loggedFirstVideoFrame = false
     private var loggedFirstAudioFrame = false
+    private var lastRenderedAudioPTS: CMTime?
+    private var lastRenderedAudioUptime: TimeInterval?
+    private var audioTimelineAnchorPTS: CMTime?
+    private var audioTimelineAnchorUptime: TimeInterval?
     private var lastRenderedVideoPTS: CMTime?
     private var lastRenderedVideoUptime: TimeInterval?
+    private var videoTimelineAnchorPTS: CMTime?
+    private var videoTimelineAnchorUptime: TimeInterval?
+    private var videoRenderStartUptime: TimeInterval?
+    private var videoRenderStartPTS: CMTime?
+    private var lastQueueHealthLogUptime: TimeInterval = 0
+    private var renderedVideoFrameCount: Int = 0
+    private var lastDecodedVideoFramePTS: CMTime?
+    private var lastDecodedVideoFrameUptime: TimeInterval?
+    private var lastVideoDecodeElapsedMs: Double = 0
+    private let liveAudioPacketBacklogSoftLimitSeconds: Double = 0.45
+    private let liveVideoPacketBacklogSoftLimitSeconds: Double = 1.20
+    private let liveFrameBacklogSoftLimitSeconds: Double = 0.35
+    private let liveVideoDecodeLeadSoftLimitSeconds: Double = 0.18
 
     public init(
         clock: MediaClock = MediaClock(),
@@ -52,16 +85,18 @@ public actor PlaybackSession: PlayerEngine {
         self.demuxer = demuxer
         self.videoPipeline = videoPipeline
         self.audioPipeline = audioPipeline
+        self.videoPresenter = VideoPresenter(diagnostics: diagnostics)
     }
 
     public func load(_ source: PlayableSource) async throws {
         _ = source
-        stopPlaybackTasks()
-        packetCount = 0
-        loggedFirstVideoFrame = false
-        loggedFirstAudioFrame = false
-        lastRenderedVideoPTS = nil
-        lastRenderedVideoUptime = nil
+        await stopPlaybackTasks()
+        await resetRuntimeState()
+        sourceDescriptor = source.descriptor
+        await configureQueues(for: source.descriptor)
+        for output in audioOutputs.values {
+            (output as? any AudioOutputSourceConfigurable)?.configure(for: source.descriptor)
+        }
         diagnostics.log("load_requested")
         setState(.loading)
         knownDuration = await demuxer.duration()
@@ -74,7 +109,7 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     public func play() async {
-        guard playTask == nil else { return }
+        guard demuxTask == nil else { return }
         if case .ended = state {
             diagnostics.log("play_requested_from_ended -> restart_from_zero")
             do {
@@ -96,20 +131,20 @@ public actor PlaybackSession: PlayerEngine {
         for output in audioOutputs.values {
             (output as? any AudioOutputLifecycle)?.handlePlay()
         }
+        await startWorkerTasksIfNeeded()
         watchdogTask = Task { [weak self] in
             guard let self else { return }
             await self.monitorForStalls()
         }
-        startVideoPacketLoopIfNeeded()
-        playTask = Task { [weak self] in
+        demuxTask = Task { [weak self] in
             guard let self else { return }
-            await self.consumePackets()
+            await self.runDemuxLoop()
         }
     }
 
     public func pause() async {
         diagnostics.log("pause_requested")
-        stopPlaybackTasks()
+        await stopPlaybackTasks()
         clock.pause()
         setState(.paused)
         for output in audioOutputs.values {
@@ -118,21 +153,27 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     public func seek(to time: CMTime) async throws {
-        let resumeAfterSeek = playTask != nil
+        let resumeAfterSeek = demuxTask != nil
         diagnostics.log("seek_requested_seconds=\(time.seconds)")
-        stopPlaybackTasks()
+        await stopPlaybackTasks()
         clock.seek(to: time)
         setState(resumeAfterSeek ? .buffering : .paused)
         try await demuxer.seek(to: time)
         await videoPipeline.flush()
         await audioPipeline.flush()
         lastAudioPTS = nil
+        lastRenderedAudioPTS = nil
+        lastRenderedAudioUptime = nil
+        audioTimelineAnchorPTS = nil
+        audioTimelineAnchorUptime = nil
         lastRenderedVideoPTS = nil
         lastRenderedVideoUptime = nil
+        waitingForVideoKeyframeResync = false
         lastPacketUptime = ProcessInfo.processInfo.systemUptime
         for output in videoOutputs.values {
             (output as? any VideoOutputLifecycle)?.handleDiscontinuity()
         }
+        await videoPresenter.handleDiscontinuity()
         for output in audioOutputs.values {
             (output as? any AudioOutputLifecycle)?.handleDiscontinuity()
         }
@@ -143,10 +184,12 @@ public actor PlaybackSession: PlayerEngine {
 
     public func attachVideoOutput(_ output: any VideoOutput) async {
         videoOutputs[ObjectIdentifier(output)] = output
+        await videoPresenter.attachOutput(output)
     }
 
     public func detachVideoOutput(_ output: any VideoOutput) async {
         videoOutputs.removeValue(forKey: ObjectIdentifier(output))
+        await videoPresenter.detachOutput(output)
     }
 
     public func attachAudioOutput(_ output: any AudioOutput) async {
@@ -193,37 +236,35 @@ public actor PlaybackSession: PlayerEngine {
         diagnostics.snapshot()
     }
 
-    private func consumePackets() async {
+    private func runDemuxLoop() async {
         do {
             diagnostics.log("packet_consumer_started")
             let stream = await demuxer.makePacketStream()
             for try await packet in stream {
                 if Task.isCancelled { break }
+                try? await throttleLiveIngestionIfNeeded()
                 packetCount += 1
                 if packetCount == 1 || packetCount % 100 == 0 {
-                    diagnostics.log("packet_received count=\(packetCount) codec=\(packet.formatHint) pts=\(String(describing: packet.pts)) size=\(packet.data.count)")
+                    //diagnostics.log("packet_received count=\(packetCount) codec=\(packet.formatHint) pts=\(String(describing: packet.pts)) size=\(packet.data.count)")
                 }
                 lastPacketUptime = ProcessInfo.processInfo.systemUptime
                 emitEvent(.progress(position: clock.currentTime(), duration: knownDuration))
                 if case .buffering = state {
                     setState(.playing)
+                    await logQueueHealth(context: "playback_recovered")
                     diagnostics.log("playback_recovered")
                     emitEvent(.recovered)
                 }
                 switch packet.formatHint {
                 case .h264, .hevc:
-                    enqueueVideoPacket(packet)
-                case .aac, .ac3, .eac3, .opus:
-                    if let frame = try await audioPipeline.decode(packet: packet) {
-                        if !loggedFirstAudioFrame {
-                            loggedFirstAudioFrame = true
-                            diagnostics.log("first_audio_frame pts=\(frame.pts.seconds)")
-                        }
-                        syncAudioMasterClock(with: frame.pts)
-                        for output in audioOutputs.values {
-                            output.render(frame: frame)
+                    if !(await videoPacketQueue.enqueue(packet)) {
+                        droppedVideoPackets += 1
+                        if droppedVideoPackets == 1 || droppedVideoPackets % 30 == 0 {
+                            diagnostics.log("video_packet_drop_overflow count=\(droppedVideoPackets) keyframe=\(packet.isKeyframe)")
                         }
                     }
+                case .aac, .ac3, .eac3, .opus:
+                    _ = await audioPacketQueue.enqueue(packet)
                 case .unknown:
                     continue
                 }
@@ -232,13 +273,18 @@ public actor PlaybackSession: PlayerEngine {
                 return
             }
             diagnostics.log("packet_stream_ended")
-            setState(.ended)
-            emitEvent(.ended)
+            demuxCompleted = true
+            await logQueueHealth(context: "packet_stream_ended")
+            await audioPacketQueue.close()
+            await videoPacketQueue.close()
+            await maybeFinishPlaybackAfterDrain()
         } catch {
             let playerError = makePlayerError(from: error)
             let description = describe(playerError)
             diagnostics.incrementDecodeFailure()
             diagnostics.log("playback_error: \(description)")
+            await audioPacketQueue.close()
+            await videoPacketQueue.close()
             setState(.failed(description))
             emitEvent(.error(description))
         }
@@ -247,8 +293,11 @@ public actor PlaybackSession: PlayerEngine {
     private func monitorForStalls() async {
         while !Task.isCancelled {
             let now = ProcessInfo.processInfo.systemUptime
-            let stalled = now - lastPacketUptime > rebufferThreshold
+            let sourceTimedOut = !demuxCompleted && (now - lastPacketUptime > rebufferThreshold)
+            let buffersDrained = await arePlaybackBuffersDepletedForStall()
+            let stalled = sourceTimedOut && buffersDrained
             if stalled, case .playing = state {
+                await logQueueHealth(context: "playback_stalled")
                 setState(.buffering)
                 diagnostics.incrementRebuffer()
                 diagnostics.log("playback_stalled")
@@ -256,6 +305,49 @@ public actor PlaybackSession: PlayerEngine {
             }
             emitEvent(.progress(position: clock.currentTime(), duration: knownDuration))
             try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    private func arePlaybackBuffersDepletedForStall() async -> Bool {
+        let audio = await audioPacketQueue.snapshot()
+        let video = await videoPacketQueue.snapshot()
+        let videoFrames = await videoFrameQueue.snapshot()
+
+        let audioBacklog = audio.mediaSpanSeconds ?? 0
+        let videoPacketBacklog = video.mediaSpanSeconds ?? 0
+        let videoFrameBacklog = videoFrames.mediaSpanSeconds ?? 0
+
+        if audioBacklog > audioStallLowWaterSeconds {
+            return false
+        }
+        if videoFrameBacklog > videoFrameStallLowWaterSeconds {
+            return false
+        }
+        if videoPacketBacklog > videoPacketStallLowWaterSeconds {
+            return false
+        }
+        return true
+    }
+
+    private func throttleLiveIngestionIfNeeded() async throws {
+        guard sourceDescriptor?.isLive == true else { return }
+
+        while !Task.isCancelled {
+            let audio = await audioPacketQueue.snapshot()
+            let video = await videoPacketQueue.snapshot()
+            let videoFrames = await videoFrameQueue.snapshot()
+
+            let audioBacklog = audio.mediaSpanSeconds ?? 0
+            let videoBacklog = video.mediaSpanSeconds ?? 0
+            let frameBacklog = videoFrames.mediaSpanSeconds ?? 0
+
+            let shouldThrottle =
+                audioBacklog > liveAudioPacketBacklogSoftLimitSeconds ||
+                videoBacklog > liveVideoPacketBacklogSoftLimitSeconds ||
+                frameBacklog > liveFrameBacklogSoftLimitSeconds
+
+            guard shouldThrottle else { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 
@@ -285,14 +377,17 @@ public actor PlaybackSession: PlayerEngine {
         await videoPipeline.flush()
         await audioPipeline.flush()
         lastAudioPTS = nil
+        lastRenderedAudioPTS = nil
+        lastRenderedAudioUptime = nil
+        audioTimelineAnchorPTS = nil
+        audioTimelineAnchorUptime = nil
         lastRenderedVideoPTS = nil
         lastRenderedVideoUptime = nil
-        packetCount = 0
-        loggedFirstVideoFrame = false
-        loggedFirstAudioFrame = false
+        await resetRuntimeState()
         for output in videoOutputs.values {
             (output as? any VideoOutputLifecycle)?.handleDiscontinuity()
         }
+        await videoPresenter.handleDiscontinuity()
         for output in audioOutputs.values {
             (output as? any AudioOutputLifecycle)?.handleDiscontinuity()
         }
@@ -302,6 +397,26 @@ public actor PlaybackSession: PlayerEngine {
     private func paceVideoIfNeeded(framePTS: CMTime) async throws {
         guard framePTS.isValid else { return }
         let now = ProcessInfo.processInfo.systemUptime
+
+        if lastAudioPTS == nil {
+            guard let anchorPTS = videoTimelineAnchorPTS, let anchorUptime = videoTimelineAnchorUptime else {
+                videoTimelineAnchorPTS = framePTS
+                videoTimelineAnchorUptime = now
+                lastRenderedVideoPTS = framePTS
+                lastRenderedVideoUptime = now
+                return
+            }
+
+            let targetUptime = anchorUptime + max(0, framePTS.seconds - anchorPTS.seconds)
+            let sleepSeconds = targetUptime - now
+            if sleepSeconds > 0 {
+                try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+            }
+
+            lastRenderedVideoPTS = framePTS
+            lastRenderedVideoUptime = ProcessInfo.processInfo.systemUptime
+            return
+        }
 
         guard let lastPTS = lastRenderedVideoPTS, let lastUptime = lastRenderedVideoUptime else {
             lastRenderedVideoPTS = framePTS
@@ -323,61 +438,373 @@ public actor PlaybackSession: PlayerEngine {
         lastRenderedVideoUptime = ProcessInfo.processInfo.systemUptime
     }
 
-    private func stopPlaybackTasks() {
-        playTask?.cancel()
-        playTask = nil
+    private func paceAudioIfNeeded(framePTS: CMTime) async throws {
+        guard framePTS.isValid else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+
+        guard let anchorPTS = audioTimelineAnchorPTS, let anchorUptime = audioTimelineAnchorUptime else {
+            audioTimelineAnchorPTS = framePTS
+            audioTimelineAnchorUptime = now
+            lastRenderedAudioPTS = framePTS
+            lastRenderedAudioUptime = now
+            return
+        }
+
+        let targetUptime = anchorUptime + max(0, framePTS.seconds - anchorPTS.seconds)
+        let sleepSeconds = targetUptime - now
+        if sleepSeconds > 0 {
+            try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+        }
+
+        lastRenderedAudioPTS = framePTS
+        lastRenderedAudioUptime = ProcessInfo.processInfo.systemUptime
+    }
+
+    private func stopPlaybackTasks() async {
+        demuxTask?.cancel()
+        demuxTask = nil
+        audioTask?.cancel()
+        audioTask = nil
+        videoDecodeTask?.cancel()
+        videoDecodeTask = nil
+        videoPresentTask?.cancel()
+        videoPresentTask = nil
         watchdogTask?.cancel()
         watchdogTask = nil
-        videoPacketContinuation?.finish()
-        videoPacketContinuation = nil
-        videoPacketTask?.cancel()
-        videoPacketTask = nil
+        await audioPacketQueue.close()
+        await videoPacketQueue.close()
+        await videoFrameQueue.close()
     }
 
-    private func startVideoPacketLoopIfNeeded() {
-        guard videoPacketTask == nil else { return }
-        // Do not drop compressed video packets: dropping inter-frames causes visible artifacts.
-        let stream = AsyncStream<DemuxedPacket>(bufferingPolicy: .unbounded) { continuation in
-            self.videoPacketContinuation = continuation
+    private func configureQueues(for descriptor: MediaSourceDescriptor) async {
+        let hasAudio: Bool
+        let hasVideo: Bool
+        if descriptor.streams.isEmpty {
+            switch descriptor.kind {
+            case .liveTS:
+                hasAudio = true
+                hasVideo = true
+            case .segmented:
+                hasAudio = true
+                hasVideo = true
+            case .file, .network:
+                hasAudio = descriptor.preferredClock == .audio
+                hasVideo = true
+            }
+        } else {
+            hasAudio = descriptor.streams.contains { $0.kind == .audio }
+            hasVideo = descriptor.streams.contains { $0.kind == .video }
         }
-        videoPacketTask = Task { [weak self] in
+
+        let audioCapacity: Int
+        if descriptor.isLive {
+            audioCapacity = 512
+        } else {
+            audioCapacity = 256
+        }
+
+        let videoCapacity: Int
+        let videoOverflowPolicy: PacketQueueOverflowPolicy
+        let videoFrameCapacity: Int
+        let videoFrameOverflowPolicy: FrameQueueOverflowPolicy
+        if descriptor.isLive {
+            videoCapacity = hasAudio ? 180 : 240
+            videoOverflowPolicy = .preferKeyframes
+            videoFrameCapacity = hasAudio ? 18 : 24
+            videoFrameOverflowPolicy = .blockProducer
+        } else {
+            videoCapacity = hasAudio ? 240 : 600
+            videoOverflowPolicy = .blockProducer
+            videoFrameCapacity = hasAudio ? 24 : 36
+            videoFrameOverflowPolicy = .blockProducer
+        }
+
+        await audioPacketQueue.configure(capacity: audioCapacity, overflowPolicy: .blockProducer)
+        await videoPacketQueue.configure(capacity: videoCapacity, overflowPolicy: videoOverflowPolicy)
+        await videoFrameQueue.configure(capacity: videoFrameCapacity, overflowPolicy: videoFrameOverflowPolicy)
+
+        diagnostics.log(
+            "queue_profile live=\(descriptor.isLive) hasAudio=\(hasAudio) hasVideo=\(hasVideo) " +
+            "audioCapacity=\(audioCapacity) videoCapacity=\(videoCapacity) frameCapacity=\(videoFrameCapacity) " +
+            "videoPolicy=\(String(describing: videoOverflowPolicy)) framePolicy=\(String(describing: videoFrameOverflowPolicy))"
+        )
+    }
+
+    private func startWorkerTasksIfNeeded() async {
+        guard audioTask == nil, videoDecodeTask == nil, videoPresentTask == nil else { return }
+        demuxCompleted = false
+        audioWorkerFinished = false
+        videoDecodeWorkerFinished = false
+        videoPresentWorkerFinished = false
+        droppedVideoPackets = 0
+        await audioPacketQueue.reset()
+        await videoPacketQueue.reset()
+        await videoFrameQueue.reset()
+        audioTask = Task { [weak self] in
             guard let self else { return }
-            await self.consumeVideoPackets(stream: stream)
+            await self.consumeAudioPackets()
+        }
+        videoDecodeTask = Task { [weak self] in
+            guard let self else { return }
+            await self.decodeVideoPackets()
+        }
+        videoPresentTask = Task { [weak self] in
+            guard let self else { return }
+            await self.videoPresenter.presentFrames(
+                from: self.videoFrameQueue,
+                shouldDropLateFrame: { [weak self] pts in
+                    guard let self else { return false }
+                    return await self.shouldDropLateVideoFrameAsync(pts)
+                },
+                masterClockProvider: { [weak self] in
+                    guard let self else { return nil }
+                    return await self.currentAudioClockForPresentation()
+                },
+                preferredLeadSeconds: sourceDescriptor?.isLive == true ? 0.08 : 0.0,
+                renderHealthLogger: { [weak self] context, framePTS, decodeElapsedMs, renderElapsedMs, queueWaitMs, audioLeadMs in
+                    guard let self else { return }
+                    await self.logVideoRenderHealth(
+                        context: context,
+                        framePTS: framePTS,
+                        decodeElapsedMs: decodeElapsedMs,
+                        renderElapsedMs: renderElapsedMs,
+                        queueWaitMs: queueWaitMs,
+                        audioLeadMs: audioLeadMs
+                    )
+                }
+            )
+            await self.finishVideoPresentWorker()
         }
     }
 
-    private func enqueueVideoPacket(_ packet: DemuxedPacket) {
-        videoPacketContinuation?.yield(packet)
-    }
-
-    private func consumeVideoPackets(stream: AsyncStream<DemuxedPacket>) async {
-        do {
-            for await packet in stream {
-                if Task.isCancelled { return }
-                if let frame = try await videoPipeline.decode(packet: packet) {
-                    guard frame.pixelBuffer != nil else {
-                        throw PlaybackSessionError.renderOutputMissing
+    private func consumeAudioPackets() async {
+        while let packet = await audioPacketQueue.dequeue() {
+            if Task.isCancelled { return }
+            do {
+                let frames = try await audioPipeline.decode(packet: packet)
+                guard !frames.isEmpty else { continue }
+                for frame in frames {
+                    if !loggedFirstAudioFrame {
+                        loggedFirstAudioFrame = true
+                        diagnostics.log("first_audio_frame pts=\(frame.pts.seconds)")
                     }
-                    try await paceVideoIfNeeded(framePTS: frame.pts)
-                    if !loggedFirstVideoFrame {
-                        loggedFirstVideoFrame = true
-                        diagnostics.log("first_video_frame pts=\(frame.pts.seconds)")
-                    }
-                    diagnostics.markFirstFrameRendered()
-                    for output in videoOutputs.values {
+                    syncAudioMasterClock(with: frame.pts)
+                    try await paceAudioIfNeeded(framePTS: frame.pts)
+                    for output in audioOutputs.values {
                         output.render(frame: frame)
                     }
                 }
+            } catch {
+                if Task.isCancelled { return }
+                diagnostics.incrementDecodeFailure()
+                let description = describe(makePlayerError(from: error))
+                diagnostics.log("audio_decode_drop error=\(description)")
             }
-        } catch {
-            if Task.isCancelled { return }
-            let playerError = makePlayerError(from: error)
-            let description = describe(playerError)
-            diagnostics.incrementDecodeFailure()
-            diagnostics.log("video_processing_error: \(description)")
-            setState(.failed(description))
-            emitEvent(.error(description))
         }
+        audioWorkerFinished = true
+        await maybeFinishPlaybackAfterDrain()
+    }
+
+    private func decodeVideoPackets() async {
+        while let packet = await videoPacketQueue.dequeue() {
+            if Task.isCancelled { return }
+            if waitingForVideoKeyframeResync {
+                guard packet.isKeyframe else { continue }
+                if let audioPTS = lastAudioPTS, let keyPTS = packet.pts {
+                    let keyTime = CMTime(value: keyPTS, timescale: 90_000)
+                    if (audioPTS - keyTime).seconds > 0.300 {
+                        continue
+                    }
+                }
+                waitingForVideoKeyframeResync = false
+                lastRenderedVideoPTS = nil
+                lastRenderedVideoUptime = nil
+                await videoPipeline.flush()
+                diagnostics.log("video_resync_keyframe pts=\(String(describing: packet.pts))")
+            }
+            do {
+                let decodeStart = ProcessInfo.processInfo.systemUptime
+                if let frame = try await videoPipeline.decode(packet: packet) {
+                    let decodeElapsedMs = (ProcessInfo.processInfo.systemUptime - decodeStart) * 1000
+                    guard frame.pixelBuffer != nil else {
+                        throw PlaybackSessionError.renderOutputMissing
+                    }
+                    try await throttleLiveDecodedVideoIfNeeded(framePTS: frame.pts)
+                    let instrumentedFrame = DecodedVideoFrame(
+                        pts: frame.pts,
+                        pixelBuffer: frame.pixelBuffer,
+                        opaqueDecoderPayload: frame.opaqueDecoderPayload,
+                        colorInfo: frame.colorInfo,
+                        decodeElapsedMs: decodeElapsedMs,
+                        enqueuedUptime: ProcessInfo.processInfo.systemUptime
+                    )
+                    lastDecodedVideoFramePTS = frame.pts
+                    lastDecodedVideoFrameUptime = ProcessInfo.processInfo.systemUptime
+                    lastVideoDecodeElapsedMs = decodeElapsedMs
+                    if !(await videoFrameQueue.enqueue(instrumentedFrame)) {
+                        return
+                    }
+                    consecutiveVideoDecodeFailures = 0
+                }
+            } catch {
+                if Task.isCancelled { return }
+                consecutiveVideoDecodeFailures += 1
+                diagnostics.incrementDecodeFailure()
+                let playerError = makePlayerError(from: error)
+                let description = describe(playerError)
+                if consecutiveVideoDecodeFailures == 1 || consecutiveVideoDecodeFailures % 10 == 0 {
+                    await logQueueHealth(context: "video_decode_drop_\(consecutiveVideoDecodeFailures)")
+                    diagnostics.log("video_decode_drop count=\(consecutiveVideoDecodeFailures) error=\(description)")
+                }
+                waitingForVideoKeyframeResync = true
+                lastRenderedVideoPTS = nil
+                lastRenderedVideoUptime = nil
+            }
+        }
+        videoDecodeWorkerFinished = true
+        await videoFrameQueue.close()
+        await maybeFinishPlaybackAfterDrain()
+    }
+
+    private func throttleLiveDecodedVideoIfNeeded(framePTS: CMTime) async throws {
+        guard sourceDescriptor?.isLive == true, framePTS.isValid else { return }
+
+        while !Task.isCancelled {
+            guard let audioClock = currentAudioClockForPresentation(),
+                  audioClock.isValid,
+                  audioClock.seconds > 1.0 else {
+                return
+            }
+
+            let leadSeconds = framePTS.seconds - audioClock.seconds
+            let sleepSeconds = leadSeconds - liveVideoDecodeLeadSoftLimitSeconds
+            if sleepSeconds <= 0.01 {
+                return
+            }
+
+            let boundedSleep = min(0.02, sleepSeconds)
+            try await Task.sleep(nanoseconds: UInt64(boundedSleep * 1_000_000_000))
+        }
+    }
+
+    private func finishVideoPresentWorker() async {
+        videoPresentWorkerFinished = true
+        await maybeFinishPlaybackAfterDrain()
+    }
+
+    private func shouldDropLateVideoFrameAsync(_ framePTS: CMTime) -> Bool {
+        guard framePTS.isValid,
+              let audioPTS = currentAudioClockForPresentation(),
+              audioPTS.isValid else {
+            return false
+        }
+        return (audioPTS - framePTS).seconds > 0.200
+    }
+
+    private func currentAudioClockForPresentation() -> CMTime? {
+        for output in audioOutputs.values {
+            if let provider = output as? any AudioPlaybackClockProviding,
+               let playbackTime = provider.currentPlaybackTime(),
+               playbackTime.isValid {
+                return playbackTime
+            }
+        }
+        return lastAudioPTS
+    }
+
+    private func maybeFinishPlaybackAfterDrain() async {
+        guard demuxCompleted, audioWorkerFinished, videoDecodeWorkerFinished, videoPresentWorkerFinished else { return }
+        setState(.ended)
+        emitEvent(.ended)
+    }
+
+    private func resetRuntimeState() async {
+        packetCount = 0
+        droppedVideoPackets = 0
+        demuxCompleted = false
+        audioWorkerFinished = false
+        videoDecodeWorkerFinished = false
+        videoPresentWorkerFinished = false
+        consecutiveVideoDecodeFailures = 0
+        waitingForVideoKeyframeResync = false
+        loggedFirstVideoFrame = false
+        loggedFirstAudioFrame = false
+        lastAudioPTS = nil
+        lastRenderedAudioPTS = nil
+        lastRenderedAudioUptime = nil
+        audioTimelineAnchorPTS = nil
+        audioTimelineAnchorUptime = nil
+        lastRenderedVideoPTS = nil
+        lastRenderedVideoUptime = nil
+        videoTimelineAnchorPTS = nil
+        videoTimelineAnchorUptime = nil
+        videoRenderStartUptime = nil
+        videoRenderStartPTS = nil
+        lastQueueHealthLogUptime = 0
+        renderedVideoFrameCount = 0
+        lastDecodedVideoFramePTS = nil
+        lastDecodedVideoFrameUptime = nil
+        lastVideoDecodeElapsedMs = 0
+        await audioPacketQueue.reset()
+        await videoPacketQueue.reset()
+        await videoFrameQueue.reset()
+        await videoPresenter.reset()
+    }
+
+    private func logQueueHealth(context: String, throttleSeconds: TimeInterval = 0) async {
+        let now = ProcessInfo.processInfo.systemUptime
+        if throttleSeconds > 0, now - lastQueueHealthLogUptime < throttleSeconds {
+            return
+        }
+        lastQueueHealthLogUptime = now
+        let audio = await audioPacketQueue.snapshot()
+        let video = await videoPacketQueue.snapshot()
+        let videoFrames = await videoFrameQueue.snapshot()
+        let audioBacklog = audio.mediaSpanSeconds.map { String(format: "%.3f", $0) } ?? "nil"
+        let videoBacklog = video.mediaSpanSeconds.map { String(format: "%.3f", $0) } ?? "nil"
+        let videoFrameBacklog = videoFrames.mediaSpanSeconds.map { String(format: "%.3f", $0) } ?? "nil"
+        let audioPTS: String
+        if let lastAudioPTS {
+            audioPTS = String(format: "%.3f", lastAudioPTS.seconds)
+        } else {
+            audioPTS = "nil"
+        }
+        diagnostics.log(
+            "queue_health context=\(context) " +
+            "audio=count:\(audio.count)/\(audio.capacity),backlog:\(audioBacklog),firstPTS:\(String(describing: audio.firstPTS)),lastPTS:\(String(describing: audio.lastPTS)) " +
+            "video=count:\(video.count)/\(video.capacity),backlog:\(videoBacklog),firstPTS:\(String(describing: video.firstPTS)),lastPTS:\(String(describing: video.lastPTS)) " +
+            "videoFrames=count:\(videoFrames.count)/\(videoFrames.capacity),backlog:\(videoFrameBacklog),firstPTS:\(String(describing: videoFrames.firstPTSSeconds)),lastPTS:\(String(describing: videoFrames.lastPTSSeconds)) " +
+            "audioClock=\(audioPTS) waitingKeyframe=\(waitingForVideoKeyframeResync)"
+        )
+    }
+
+    private func logVideoRenderHealth(
+        context: String,
+        framePTS: CMTime,
+        decodeElapsedMs: Double,
+        renderElapsedMs: Double,
+        queueWaitMs: Double,
+        audioLeadMs: Double?
+    ) async {
+        await logQueueHealth(context: context)
+        let wallElapsed: String
+        if let start = videoRenderStartUptime {
+            wallElapsed = String(format: "%.3f", ProcessInfo.processInfo.systemUptime - start)
+        } else {
+            wallElapsed = "nil"
+        }
+        let mediaElapsed: String
+        if let startPTS = videoRenderStartPTS {
+            mediaElapsed = String(format: "%.3f", framePTS.seconds - startPTS.seconds)
+        } else {
+            mediaElapsed = "nil"
+        }
+        diagnostics.log(
+            "video_timing context=\(context) framePTS=\(String(format: "%.3f", framePTS.seconds)) " +
+            "decodeMs=\(String(format: "%.2f", decodeElapsedMs)) renderMs=\(String(format: "%.2f", renderElapsedMs)) " +
+            "queueWaitMs=\(String(format: "%.2f", queueWaitMs)) audioLeadMs=\(audioLeadMs.map { String(format: "%.2f", $0) } ?? "nil") " +
+            "wallElapsed=\(wallElapsed) mediaElapsed=\(mediaElapsed)"
+        )
     }
 
     private func makePlayerError(from error: Error) -> PlayerError {
@@ -445,6 +872,283 @@ private struct AudioSynchronizerAdapter: Sendable {
         }
         let correction = CMTime(seconds: drift.seconds * 0.5, preferredTimescale: 90_000)
         return videoPTS - correction
+    }
+}
+
+private actor VideoPresenter {
+    private let diagnostics: PlaybackDiagnostics
+    private var outputs: [ObjectIdentifier: any VideoOutput] = [:]
+    private var loggedFirstVideoFrame = false
+    private var lastRenderedVideoPTS: CMTime?
+    private var lastRenderedVideoUptime: TimeInterval?
+    private var videoTimelineAnchorPTS: CMTime?
+    private var videoTimelineAnchorUptime: TimeInterval?
+    private var videoRenderStartUptime: TimeInterval?
+    private var videoRenderStartPTS: CMTime?
+    private var renderedVideoFrameCount = 0
+    private var droppedLiveFrames = 0
+
+    init(diagnostics: PlaybackDiagnostics) {
+        self.diagnostics = diagnostics
+    }
+
+    func attachOutput(_ output: any VideoOutput) {
+        outputs[ObjectIdentifier(output)] = output
+    }
+
+    func detachOutput(_ output: any VideoOutput) {
+        outputs.removeValue(forKey: ObjectIdentifier(output))
+    }
+
+    func reset() {
+        loggedFirstVideoFrame = false
+        lastRenderedVideoPTS = nil
+        lastRenderedVideoUptime = nil
+        videoTimelineAnchorPTS = nil
+        videoTimelineAnchorUptime = nil
+        videoRenderStartUptime = nil
+        videoRenderStartPTS = nil
+        renderedVideoFrameCount = 0
+        droppedLiveFrames = 0
+    }
+
+    func handleDiscontinuity() {
+        lastRenderedVideoPTS = nil
+        lastRenderedVideoUptime = nil
+        videoTimelineAnchorPTS = nil
+        videoTimelineAnchorUptime = nil
+        videoRenderStartUptime = nil
+        videoRenderStartPTS = nil
+        renderedVideoFrameCount = 0
+        droppedLiveFrames = 0
+    }
+
+    func presentFrames(
+        from frameQueue: FrameQueue,
+        shouldDropLateFrame: @escaping @Sendable (CMTime) async -> Bool,
+        masterClockProvider: @escaping @Sendable () async -> CMTime?,
+        preferredLeadSeconds: Double,
+        renderHealthLogger: @escaping @Sendable (String, CMTime, Double, Double, Double, Double?) async -> Void
+    ) async {
+        if preferredLeadSeconds > 0 {
+            await presentLiveFrames(
+                from: frameQueue,
+                shouldDropLateFrame: shouldDropLateFrame,
+                masterClockProvider: masterClockProvider,
+                preferredLeadSeconds: preferredLeadSeconds,
+                renderHealthLogger: renderHealthLogger
+            )
+            return
+        }
+
+        while !Task.isCancelled {
+            guard let frame = await frameQueue.dequeue() else { break }
+            if Task.isCancelled { return }
+            do {
+                if await shouldDropLateFrame(frame.pts) {
+                    continue
+                }
+                try await pace(
+                    framePTS: frame.pts,
+                    masterClockProvider: masterClockProvider,
+                    preferredLeadSeconds: preferredLeadSeconds
+                )
+                if !loggedFirstVideoFrame {
+                    loggedFirstVideoFrame = true
+                    diagnostics.log("first_video_frame pts=\(frame.pts.seconds)")
+                }
+                diagnostics.markFirstFrameRendered()
+                if videoRenderStartUptime == nil {
+                    videoRenderStartUptime = ProcessInfo.processInfo.systemUptime
+                    videoRenderStartPTS = frame.pts
+                }
+                let renderStart = ProcessInfo.processInfo.systemUptime
+                renderedVideoFrameCount += 1
+                for output in outputs.values {
+                    output.render(frame: frame)
+                }
+                let renderElapsedMs = (ProcessInfo.processInfo.systemUptime - renderStart) * 1000
+                let queueWaitMs = frame.enqueuedUptime.map { (renderStart - $0) * 1000 } ?? 0
+                let audioLeadMs: Double?
+                if let masterClock = await masterClockProvider(), masterClock.isValid {
+                    audioLeadMs = (frame.pts.seconds - masterClock.seconds) * 1000
+                } else {
+                    audioLeadMs = nil
+                }
+                if renderedVideoFrameCount == 1 || renderedVideoFrameCount % 60 == 0 {
+                    await renderHealthLogger(
+                        "video_render_\(renderedVideoFrameCount)",
+                        frame.pts,
+                        frame.decodeElapsedMs,
+                        renderElapsedMs,
+                        queueWaitMs,
+                        audioLeadMs
+                    )
+                }
+            } catch {
+                if Task.isCancelled { return }
+                diagnostics.log("video_present_drop error=\(String(describing: error))")
+            }
+        }
+    }
+
+    private func presentLiveFrames(
+        from frameQueue: FrameQueue,
+        shouldDropLateFrame: @escaping @Sendable (CMTime) async -> Bool,
+        masterClockProvider: @escaping @Sendable () async -> CMTime?,
+        preferredLeadSeconds: Double,
+        renderHealthLogger: @escaping @Sendable (String, CMTime, Double, Double, Double, Double?) async -> Void
+    ) async {
+        var pendingFrame: DecodedVideoFrame?
+
+        while !Task.isCancelled {
+            if pendingFrame == nil {
+                guard let dequeued = await frameQueue.dequeue() else { break }
+                pendingFrame = dequeued
+            }
+
+            guard let frame = pendingFrame else { continue }
+
+            do {
+                if await shouldDropLateFrame(frame.pts) {
+                    droppedLiveFrames += 1
+                    if droppedLiveFrames == 1 || droppedLiveFrames % 30 == 0 {
+                        diagnostics.log("video_live_drop count=\(droppedLiveFrames) latestPTS=\(String(format: "%.3f", frame.pts.seconds))")
+                    }
+                    pendingFrame = nil
+                    continue
+                }
+
+                pendingFrame = nil
+                try await paceLiveRelativeToAnchor(framePTS: frame.pts)
+                try await render(
+                    frame: frame,
+                    masterClockProvider: masterClockProvider,
+                    renderHealthLogger: renderHealthLogger
+                )
+            } catch {
+                if Task.isCancelled { return }
+                diagnostics.log("video_present_drop error=\(String(describing: error))")
+                pendingFrame = nil
+            }
+        }
+    }
+
+    private func render(
+        frame: DecodedVideoFrame,
+        masterClockProvider: @escaping @Sendable () async -> CMTime?,
+        renderHealthLogger: @escaping @Sendable (String, CMTime, Double, Double, Double, Double?) async -> Void
+    ) async throws {
+        if !loggedFirstVideoFrame {
+            loggedFirstVideoFrame = true
+            diagnostics.log("first_video_frame pts=\(frame.pts.seconds)")
+        }
+        diagnostics.markFirstFrameRendered()
+        if videoRenderStartUptime == nil {
+            videoRenderStartUptime = ProcessInfo.processInfo.systemUptime
+            videoRenderStartPTS = frame.pts
+        }
+        let renderStart = ProcessInfo.processInfo.systemUptime
+        renderedVideoFrameCount += 1
+        for output in outputs.values {
+            output.render(frame: frame)
+        }
+        let renderElapsedMs = (ProcessInfo.processInfo.systemUptime - renderStart) * 1000
+        let queueWaitMs = frame.enqueuedUptime.map { (renderStart - $0) * 1000 } ?? 0
+        let audioLeadMs: Double?
+        if let masterClock = await masterClockProvider(), masterClock.isValid {
+            audioLeadMs = (frame.pts.seconds - masterClock.seconds) * 1000
+        } else {
+            audioLeadMs = nil
+        }
+        if renderedVideoFrameCount == 1 || renderedVideoFrameCount % 60 == 0 {
+            await renderHealthLogger(
+                "video_render_\(renderedVideoFrameCount)",
+                frame.pts,
+                frame.decodeElapsedMs,
+                renderElapsedMs,
+                queueWaitMs,
+                audioLeadMs
+            )
+        }
+        lastRenderedVideoPTS = frame.pts
+        lastRenderedVideoUptime = ProcessInfo.processInfo.systemUptime
+    }
+
+    private func paceLiveRelativeToAnchor(framePTS: CMTime) async throws {
+        guard framePTS.isValid else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let anchorPTS = videoTimelineAnchorPTS, let anchorUptime = videoTimelineAnchorUptime else {
+            videoTimelineAnchorPTS = framePTS
+            videoTimelineAnchorUptime = now
+            return
+        }
+
+        let mediaOffset = framePTS.seconds - anchorPTS.seconds
+        guard mediaOffset > 0.001, mediaOffset < 30 else { return }
+
+        let targetUptime = anchorUptime + mediaOffset
+        let sleepSeconds = targetUptime - now
+        if sleepSeconds > 0 {
+            try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+        }
+    }
+
+    private func pace(
+        framePTS: CMTime,
+        masterClockProvider: @escaping @Sendable () async -> CMTime?,
+        preferredLeadSeconds: Double
+    ) async throws {
+        guard framePTS.isValid else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+
+        let targetLead = max(0, preferredLeadSeconds)
+        if targetLead > 0 {
+            while !Task.isCancelled {
+                guard let masterClock = await masterClockProvider(), masterClock.isValid else { break }
+                let lead = framePTS.seconds - masterClock.seconds
+                let sleepSeconds = lead - targetLead
+                if sleepSeconds <= 0.01 {
+                    break
+                }
+                let boundedSleep = min(0.02, sleepSeconds)
+                try await Task.sleep(nanoseconds: UInt64(boundedSleep * 1_000_000_000))
+            }
+            lastRenderedVideoPTS = framePTS
+            lastRenderedVideoUptime = ProcessInfo.processInfo.systemUptime
+            return
+        }
+
+        guard let anchorPTS = videoTimelineAnchorPTS, let anchorUptime = videoTimelineAnchorUptime else {
+            videoTimelineAnchorPTS = framePTS
+            videoTimelineAnchorUptime = now
+            lastRenderedVideoPTS = framePTS
+            lastRenderedVideoUptime = now
+            return
+        }
+
+        if let lastPTS = lastRenderedVideoPTS, let lastUptime = lastRenderedVideoUptime {
+            let interval = framePTS.seconds - lastPTS.seconds
+            if interval > 0.001, interval < 0.25 {
+                let relativeTarget = lastUptime + interval
+                let absoluteTarget = anchorUptime + max(0, framePTS.seconds - anchorPTS.seconds)
+                let targetUptime = max(relativeTarget, absoluteTarget)
+                let sleepSeconds = targetUptime - now
+                if sleepSeconds > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+                }
+            }
+        } else {
+            let targetUptime = anchorUptime + max(0, framePTS.seconds - anchorPTS.seconds)
+            let sleepSeconds = targetUptime - now
+            if sleepSeconds > 0 {
+                try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+            }
+        }
+
+        lastRenderedVideoPTS = framePTS
+        lastRenderedVideoUptime = ProcessInfo.processInfo.systemUptime
     }
 }
 

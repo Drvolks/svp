@@ -59,6 +59,15 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
                     // This is not a hard failure and should not force fallback.
                     return nil
                 }
+                if case .decodeFailed = decodeError {
+                    // Transient decode failures (e.g. missing/invalid units) should be
+                    // handled by packet/keyframe resync in the session, not by forcing
+                    // a permanent software fallback for the rest of playback.
+                    throw error
+                }
+                if case .outputUnavailable = decodeError {
+                    throw error
+                }
             }
             guard let fallback else { throw error }
             fallbackLocked = true
