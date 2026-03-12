@@ -11,7 +11,10 @@ public actor FFmpegVideoDecoder: VideoDecoder {
     public init() {}
 
     public func decode(_ packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
-        guard packet.formatHint == .h264 || packet.formatHint == .hevc else {
+        guard packet.formatHint == .h264
+            || packet.formatHint == .hevc
+            || packet.formatHint == .av1
+            || packet.formatHint == .vp9 else {
             throw VideoDecodeError.unsupportedCodec(packet.formatHint)
         }
         guard let pts = packet.pts else {
@@ -79,6 +82,8 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         switch codec {
         case .h264: return 1
         case .hevc: return 2
+        case .av1: return 7
+        case .vp9: return 8
         default: return 0
         }
     }

@@ -62,11 +62,7 @@ var targets: [Target] = [
     ),
     .executableTarget(
         name: "AVSmoke",
-        dependencies: ["SVP", "Input", "PlayerCore"],
-        resources: [
-            .copy("1-h264.mp4"),
-            .copy("1-h264.aac")
-        ]
+        dependencies: ["SVP", "Input", "PlayerCore"]
     )
 ]
 

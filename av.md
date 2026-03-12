@@ -584,3 +584,42 @@ Raison:
 - Reforcer `50 fps`
 - Refaire `lastAudioPTS - queuedAudioSeconds`
 - Réintroduire des drops vidéo massifs basés sur backlog audio
+
+### 19. Patch minimal AV1/VP9 (software FFmpeg path)
+
+Hypothèse:
+- Le player ignore AV1/VP9 avant même d'arriver au decode (enum/mapping/filtres trop restrictifs).
+
+Changements:
+- `CodecID` étendu avec `.av1` et `.vp9`.
+- Bridge C (`CShim.c`): mapping FFmpeg <-> bridge ajouté pour AV1/VP9.
+  - `AV_CODEC_ID_AV1` <-> `7`
+  - `AV_CODEC_ID_VP9` <-> `8`
+- Demux FFmpeg Swift: mapping `7/.av1`, `8/.vp9`.
+- `FFmpegVideoDecoder` accepte AV1/VP9 et crée le decoder FFmpeg avec IDs `7/8`.
+- `SplitAVDemuxEngine` considère AV1/VP9 comme paquets vidéo valides.
+- `PlaybackSession` route AV1/VP9 vers la queue vidéo (au lieu de les ignorer).
+
+Résultat build:
+- Pas d'erreur de compilation liée au patch codec.
+- Build complet reste bloqué par un problème séparé de ressources `AVSmoke` manquantes (`1-h264.mp4`, `1-h264.aac`).
+
+Verdict:
+- Base AV1/VP9 branchée bout en bout côté software decode FFmpeg.
+- Reste à valider en lecture réelle (surtout sync/stabilité), mais le pipeline ne filtre plus ces codecs par défaut.
+
+### 20. AVC1/HEVC doivent rester sur VideoToolbox
+
+Problème:
+- Le pipeline vidéo utilisait un verrou global `fallbackLocked`.
+- Après un fallback software sur un codec (ex: AV1/VP9), on pouvait rester coincé en software pour AVC1/HEVC.
+
+Changement:
+- Remplacement du verrou global par une stratégie par codec (`softwareForcedCodecs`).
+- `preferHardware=true`:
+  - AV1/VP9 bypassent directement le primaire (VT) et vont en FFmpeg software.
+  - AVC1/HEVC continuent de passer par VideoToolbox en priorité.
+- Le forçage software persistant est appliqué seulement sur erreurs de capacité du primaire (`unsupported/backend/sessionCreationFailed`) et par codec.
+
+Résultat attendu:
+- AVC1 reste hardware decode (VT) même si AV1/VP9 utilisent software.

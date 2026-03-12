@@ -57,6 +57,8 @@ static int32_t map_ffmpeg_codec_to_bridge(int codecID) {
         case AV_CODEC_ID_OPUS: return 4;
         case AV_CODEC_ID_AC3: return 5;
         case AV_CODEC_ID_EAC3: return 6;
+        case AV_CODEC_ID_AV1: return 7;
+        case AV_CODEC_ID_VP9: return 8;
         default: return 0;
     }
 #else
@@ -88,6 +90,8 @@ static int map_codec_id(int32_t codecID) {
         case 4: return AV_CODEC_ID_OPUS;
         case 5: return AV_CODEC_ID_AC3;
         case 6: return AV_CODEC_ID_EAC3;
+        case 7: return AV_CODEC_ID_AV1;
+        case 8: return AV_CODEC_ID_VP9;
         default: return AV_CODEC_ID_NONE;
     }
 #else
@@ -127,7 +131,7 @@ int32_t svp_ffmpeg_bridge_can_decode_codec(int32_t codecID) {
     }
     return avcodec_find_decoder(ffCodecID) != NULL ? 1 : 0;
 #else
-    if (codecID == 1 || codecID == 2) {
+    if (codecID == 1 || codecID == 2 || codecID == 7 || codecID == 8) {
         return 1;
     }
     return 0;
@@ -183,9 +187,21 @@ static void free_demuxer(struct svp_ffmpeg_demuxer *demuxer) {
 static int init_bitstream_filters(struct svp_ffmpeg_demuxer *demuxer) {
     int32_t streamCount;
     int32_t i;
+    const char *enableBSF;
 
     if (demuxer == NULL || demuxer->format_ctx == NULL) {
         return -1;
+    }
+
+    /*
+     * Some real-world streams can trigger hard asserts inside FFmpeg's
+     * codec bitstream (CBS) helpers used by mp4toannexb filters.
+     * Keep BSF disabled by default for app stability, and allow opt-in
+     * via environment variable when debugging specific streams.
+     */
+    enableBSF = getenv("SVP_ENABLE_BSF");
+    if (enableBSF == NULL || strcmp(enableBSF, "1") != 0) {
+        return 0;
     }
 
     streamCount = (int32_t)demuxer->format_ctx->nb_streams;
@@ -273,6 +289,7 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
 #if SVP_HAS_VENDOR_FFMPEG
     struct svp_ffmpeg_demuxer *demuxer;
     AVFormatContext *formatCtx = NULL;
+    AVDictionary *options = NULL;
 
     if (url == NULL) {
         return NULL;
@@ -280,8 +297,26 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
 
     avformat_network_init();
 
-    if (avformat_open_input(&formatCtx, url, NULL, NULL) < 0) {
+    /*
+     * Defensive network/demux options for unstable CDN responses:
+     * avoid exploding on minor corruption and prefer reconnect behavior.
+     */
+    av_dict_set(&options, "fflags", "+discardcorrupt", 0);
+    av_dict_set(&options, "err_detect", "ignore_err", 0);
+    av_dict_set(&options, "reconnect", "1", 0);
+    av_dict_set(&options, "reconnect_streamed", "1", 0);
+    av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+    av_dict_set(&options, "user_agent", "Tube2-SVP/1.0", 0);
+
+    if (avformat_open_input(&formatCtx, url, NULL, &options) < 0) {
+        av_dict_free(&options);
         return NULL;
+    }
+    av_dict_free(&options);
+
+    if (formatCtx != NULL) {
+        formatCtx->flags |= AVFMT_FLAG_DISCARD_CORRUPT;
+        formatCtx->error_recognition = AV_EF_IGNORE_ERR;
     }
     if (avformat_find_stream_info(formatCtx, NULL) < 0) {
         avformat_close_input(&formatCtx);

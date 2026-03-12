@@ -17,6 +17,7 @@ extension FFmpegDemuxError: PlaybackCategorizedError {
 }
 
 public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
+    private static let buildStamp = "SVP_LOCAL_2026-03-12T16:11"
     private let url: URL
     private let handleBox = FFmpegDemuxerHandleBox()
     private var streamInfoByIndex: [Int32: svp_ffmpeg_stream_info_t] = [:]
@@ -93,6 +94,7 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         if handleBox.raw != nil {
             return
         }
+        log("build_stamp=\(Self.buildStamp)")
         guard svp_ffmpeg_bridge_has_vendor_backend() == 1 else {
             throw FFmpegDemuxError.openFailed(reason: "vendor ffmpeg backend unavailable")
         }
@@ -182,6 +184,8 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         case 4: return .opus
         case 5: return .ac3
         case 6: return .eac3
+        case 7: return .av1
+        case 8: return .vp9
         default: return .unknown
         }
     }

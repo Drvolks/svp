@@ -30,7 +30,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
 
                 func isVideoPacket(_ packet: DemuxedPacket) -> Bool {
                     switch packet.formatHint {
-                    case .h264, .hevc:
+                    case .h264, .hevc, .av1, .vp9:
                         return true
                     default:
                         return false

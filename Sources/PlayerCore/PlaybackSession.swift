@@ -257,7 +257,7 @@ public actor PlaybackSession: PlayerEngine {
                     emitEvent(.recovered)
                 }
                 switch packet.formatHint {
-                case .h264, .hevc:
+                case .h264, .hevc, .av1, .vp9:
                     if !(await videoPacketQueue.enqueue(packet)) {
                         droppedVideoPackets += 1
                         if droppedVideoPackets == 1 || droppedVideoPackets % 30 == 0 {

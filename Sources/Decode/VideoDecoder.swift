@@ -26,9 +26,11 @@ extension VideoDecodeError: PlaybackCategorizedError {
 public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     private let primary: any VideoDecoder
     private let fallback: (any VideoDecoder)?
-    private var fallbackLocked = false
+    private let preferHardware: Bool
+    private var softwareForcedCodecs: Set<CodecID> = []
 
     public init(preferHardware: Bool = true) {
+        self.preferHardware = preferHardware
         if preferHardware {
             self.primary = VideoToolboxDecoder()
             self.fallback = FFmpegVideoDecoder()
@@ -41,10 +43,15 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     public init(decoder: any VideoDecoder) {
         self.primary = decoder
         self.fallback = nil
+        self.preferHardware = false
     }
 
     public func decode(packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
-        if fallbackLocked, let fallback {
+        if softwareForcedCodecs.contains(packet.formatHint), let fallback {
+            return try await fallback.decode(packet)
+        }
+        if shouldBypassPrimary(for: packet.formatHint), let fallback {
+            softwareForcedCodecs.insert(packet.formatHint)
             return try await fallback.decode(packet)
         }
         do {
@@ -70,7 +77,9 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
                 }
             }
             guard let fallback else { throw error }
-            fallbackLocked = true
+            if shouldForceSoftwareFallback(for: error) {
+                softwareForcedCodecs.insert(packet.formatHint)
+            }
             return try await fallback.decode(packet)
         }
     }
@@ -78,5 +87,25 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     public func flush() async {
         await primary.flush()
         await fallback?.flush()
+    }
+
+    private func shouldBypassPrimary(for codec: CodecID) -> Bool {
+        guard preferHardware else { return false }
+        switch codec {
+        case .av1, .vp9:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func shouldForceSoftwareFallback(for error: Error) -> Bool {
+        guard let decodeError = error as? VideoDecodeError else { return true }
+        switch decodeError {
+        case .unsupportedCodec, .backendUnavailable, .sessionCreationFailed:
+            return true
+        case .needMoreData, .sampleBufferCreationFailed, .decodeFailed, .outputUnavailable:
+            return false
+        }
     }
 }

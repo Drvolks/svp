@@ -26,6 +26,8 @@ public struct StreamID: Hashable, Sendable {
 public enum CodecID: Sendable {
     case h264
     case hevc
+    case av1
+    case vp9
     case aac
     case ac3
     case eac3
