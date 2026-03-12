@@ -144,7 +144,7 @@ public actor BasicDemuxEngine: PlayerCore.DemuxEngine {
             return isTransportStreamURL(url) ? nil : FFmpegDemuxAdapter(url: url)
         case .network(let url):
             return isTransportStreamURL(url) ? nil : FFmpegDemuxAdapter(url: url)
-        case .liveTS, .segmented:
+        case .liveTS, .segmented, .split:
             return nil
         }
     }

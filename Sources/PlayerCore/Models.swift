@@ -1,11 +1,12 @@
 import CoreMedia
 import Foundation
 
-public enum SourceKind: Sendable {
+public indirect enum SourceKind: Sendable {
     case file(URL)
     case network(URL)
     case liveTS(URL)
     case segmented([URL])
+    case split(video: SourceKind, audio: SourceKind)
 }
 
 public enum StreamKind: Sendable {
@@ -78,6 +79,7 @@ public struct DemuxedPacket: Sendable {
     public let dts: Int64?
     public let duration: Int64?
     public let data: Data
+    public let codecConfig: Data?
     public let isKeyframe: Bool
     public let formatHint: CodecID
 
@@ -87,6 +89,7 @@ public struct DemuxedPacket: Sendable {
         dts: Int64?,
         duration: Int64?,
         data: Data,
+        codecConfig: Data? = nil,
         isKeyframe: Bool,
         formatHint: CodecID
     ) {
@@ -95,6 +98,7 @@ public struct DemuxedPacket: Sendable {
         self.dts = dts
         self.duration = duration
         self.data = data
+        self.codecConfig = codecConfig
         self.isKeyframe = isKeyframe
         self.formatHint = formatHint
     }

@@ -23,6 +23,20 @@ public actor Player: PlayerEngine {
         }
     }
 
+    public init(videoSource: any InputSource, audioSource: any InputSource, preferHardwareDecode: Bool = true) {
+        let compositeSource = SplitAVInputSource(videoSource: videoSource, audioSource: audioSource)
+        let demux = Self.makeDemuxEngine(for: compositeSource)
+        let video = DefaultVideoPipeline(preferHardware: preferHardwareDecode)
+        let audio = DefaultAudioPipeline()
+        self.defaultAudioRenderer = AudioRenderer()
+        self.session = PlaybackSession(demuxer: demux, videoPipeline: video, audioPipeline: audio)
+        let session = self.session
+        let defaultAudioRenderer = self.defaultAudioRenderer
+        Task {
+            await session.attachAudioOutput(defaultAudioRenderer)
+        }
+    }
+
     public func load(_ source: PlayableSource) async throws {
         try await session.load(source)
     }
@@ -72,6 +86,11 @@ public actor Player: PlayerEngine {
     }
 
     private static func makeDemuxEngine(for source: any InputSource) -> any DemuxEngine {
+        if let splitSource = source as? any SplitInputSource {
+            let videoDemux = makeDemuxEngine(for: splitSource.videoSource)
+            let audioDemux = makeDemuxEngine(for: splitSource.audioSource)
+            return SplitAVDemuxEngine(videoDemuxer: videoDemux, audioDemuxer: audioDemux)
+        }
         switch source.descriptor.kind {
         case .liveTS:
             return BasicDemuxEngine(source: source)
@@ -87,6 +106,8 @@ public actor Player: PlayerEngine {
                 return BasicDemuxEngine(source: source)
             }
             return FFmpegDemuxAdapter(url: url)
+        case .split:
+            fatalError("Split sources should be handled before switching on descriptor.kind")
         }
     }
 

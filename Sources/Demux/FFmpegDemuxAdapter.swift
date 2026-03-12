@@ -20,6 +20,7 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
     private let url: URL
     private let handleBox = FFmpegDemuxerHandleBox()
     private var streamInfoByIndex: [Int32: svp_ffmpeg_stream_info_t] = [:]
+    private var streamCodecConfigByIndex: [Int32: Data] = [:]
     private var loggedFirstPacket = false
 
     public init(url: URL) {
@@ -117,6 +118,7 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             throw FFmpegDemuxError.streamInfoFailed(count)
         }
         var mapped: [Int32: svp_ffmpeg_stream_info_t] = [:]
+        var codecConfigs: [Int32: Data] = [:]
         for index in 0..<count {
             var info = svp_ffmpeg_stream_info_t()
             let status = svp_ffmpeg_demuxer_stream_info(handle, index, &info)
@@ -124,8 +126,15 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                 throw FFmpegDemuxError.streamInfoFailed(status)
             }
             mapped[index] = info
+            var codecConfig = svp_ffmpeg_codec_config_t()
+            let configStatus = svp_ffmpeg_demuxer_stream_codec_config(handle, index, &codecConfig)
+            if configStatus > 0, let data = codecConfig.data, codecConfig.size > 0 {
+                codecConfigs[index] = Data(bytes: data, count: Int(codecConfig.size))
+            }
+            svp_ffmpeg_codec_config_release(&codecConfig)
         }
         streamInfoByIndex = mapped
+        streamCodecConfigByIndex = codecConfigs
     }
 
     private func makePacket(from rawPacket: svp_ffmpeg_demuxed_packet_t) -> DemuxedPacket? {
@@ -154,6 +163,7 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             dts: normalizedDTS,
             duration: rawPacket.hasDuration == 1 ? scaleTo90k(rawPacket.duration, num: timebaseNum, den: timebaseDen) : nil,
             data: data,
+            codecConfig: streamCodecConfigByIndex[rawPacket.streamIndex],
             isKeyframe: rawPacket.isKeyframe == 1,
             formatHint: codec
         )

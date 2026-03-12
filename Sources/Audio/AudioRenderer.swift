@@ -51,6 +51,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     private var isRebuffering = true
     private var playbackAnchorPTS: CMTime?
     private var playbackAnchorSampleRate: Double?
+    private var playbackAnchorSampleTime: AVAudioFramePosition?
     private var audioClockQueryCount = 0
     private var lastDerivedPlaybackPTS: CMTime?
 
@@ -116,6 +117,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 if playbackAnchorPTS == nil || playbackAnchorSampleRate == nil {
                     playbackAnchorPTS = frame.pts
                     playbackAnchorSampleRate = format.sampleRate
+                    playbackAnchorSampleTime = nil
                 }
                 return queuedBufferSeconds
             }
@@ -211,6 +213,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             lowWaterHitCount = 0
             playbackAnchorPTS = nil
             playbackAnchorSampleRate = nil
+            playbackAnchorSampleTime = nil
             lastDerivedPlaybackPTS = nil
             audioClockQueryCount = 0
         }
@@ -233,7 +236,14 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
               let playerTime = playerNode.playerTime(forNodeTime: nodeTime) else {
             return lock.withLock { lastDerivedPlaybackPTS }
         }
-        let elapsedSeconds = Double(playerTime.sampleTime) / sampleRate
+        let elapsedSamples = lock.withLock { () -> AVAudioFramePosition in
+            if playbackAnchorSampleTime == nil {
+                playbackAnchorSampleTime = max(0, playerTime.sampleTime)
+            }
+            let anchorSampleTime = playbackAnchorSampleTime ?? max(0, playerTime.sampleTime)
+            return max(0, playerTime.sampleTime - anchorSampleTime)
+        }
+        let elapsedSeconds = Double(elapsedSamples) / sampleRate
         let playedTime = anchorPTS + CMTime(seconds: elapsedSeconds, preferredTimescale: 90_000)
         let playbackTime = lock.withLock { () -> CMTime in
             if playedTime.isValid {
@@ -249,10 +259,11 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             let sampleRateText = String(format: "%.1f", playerTime.sampleRate)
             let derivedText = String(format: "%.3f", playbackTime.seconds)
             let queuedText = String(format: "%.3f", state.2)
+            let anchorSampleText = String(lock.withLock { playbackAnchorSampleTime ?? 0 })
             print(
                 "[SVP][AudioClock] query=\(queryCount) " +
                 "anchorPTS=\(anchorText) " +
-                "sampleTime=\(playerTime.sampleTime) sampleRate=\(sampleRateText) " +
+                "sampleTime=\(playerTime.sampleTime) anchorSampleTime=\(anchorSampleText) sampleRate=\(sampleRateText) " +
                 "derivedPTS=\(derivedText) " +
                 "queued=\(queuedText)"
             )
@@ -310,6 +321,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         lock.withLock {
             playbackAnchorPTS = nil
             playbackAnchorSampleRate = nil
+            playbackAnchorSampleTime = nil
         }
         engine.disconnectNodeOutput(playerNode)
         engine.connect(playerNode, to: engine.mainMixerNode, format: format)

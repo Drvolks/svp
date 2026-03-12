@@ -36,6 +36,11 @@ typedef struct svp_ffmpeg_demuxed_packet {
     int32_t size;
 } svp_ffmpeg_demuxed_packet_t;
 
+typedef struct svp_ffmpeg_codec_config {
+    uint8_t *data;
+    int32_t size;
+} svp_ffmpeg_codec_config_t;
+
 typedef struct svp_ffmpeg_decoded_audio_frame {
     int32_t sampleRate;
     int32_t channels;
@@ -53,10 +58,12 @@ void *svp_ffmpeg_demuxer_create(const char *url);
 void svp_ffmpeg_demuxer_destroy(void *demuxer);
 int32_t svp_ffmpeg_demuxer_stream_count(void *demuxer);
 int32_t svp_ffmpeg_demuxer_stream_info(void *demuxer, int32_t index, svp_ffmpeg_stream_info_t *outInfo);
+int32_t svp_ffmpeg_demuxer_stream_codec_config(void *demuxer, int32_t index, svp_ffmpeg_codec_config_t *outConfig);
 int32_t svp_ffmpeg_demuxer_read_packet(void *demuxer, svp_ffmpeg_demuxed_packet_t *outPacket);
 int32_t svp_ffmpeg_demuxer_seek_seconds(void *demuxer, double seconds);
 double svp_ffmpeg_demuxer_duration_seconds(void *demuxer);
 void svp_ffmpeg_demuxed_packet_release(svp_ffmpeg_demuxed_packet_t *packet);
+void svp_ffmpeg_codec_config_release(svp_ffmpeg_codec_config_t *config);
 void *svp_ffmpeg_video_decoder_create(int32_t codecID);
 void svp_ffmpeg_video_decoder_destroy(void *decoder);
 int32_t svp_ffmpeg_video_decoder_flush(void *decoder);
@@ -69,6 +76,7 @@ int32_t svp_ffmpeg_video_decoder_decode(
 );
 void svp_ffmpeg_decoded_frame_release(svp_ffmpeg_decoded_frame_t *frame);
 void *svp_ffmpeg_audio_decoder_create(int32_t codecID);
+void *svp_ffmpeg_audio_decoder_create_with_extradata(int32_t codecID, const uint8_t *data, int32_t length);
 void svp_ffmpeg_audio_decoder_destroy(void *decoder);
 int32_t svp_ffmpeg_audio_decoder_flush(void *decoder);
 int32_t svp_ffmpeg_audio_decoder_decode(

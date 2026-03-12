@@ -59,6 +59,14 @@ var targets: [Target] = [
     .target(
         name: "SVP",
         dependencies: ["PlayerCore", "Input", "Demux", "Decode", "Render", "Audio", "PiP", "FFmpegBridge"]
+    ),
+    .executableTarget(
+        name: "AVSmoke",
+        dependencies: ["SVP", "Input", "PlayerCore"],
+        resources: [
+            .copy("1-h264.mp4"),
+            .copy("1-h264.aac")
+        ]
     )
 ]
 
@@ -86,7 +94,8 @@ let package = Package(
         .library(name: "Decode", targets: ["Decode"]),
         .library(name: "Render", targets: ["Render"]),
         .library(name: "Audio", targets: ["Audio"]),
-        .library(name: "PiP", targets: ["PiP"])
+        .library(name: "PiP", targets: ["PiP"]),
+        .executable(name: "AVSmoke", targets: ["AVSmoke"])
     ],
     targets: targets
 )

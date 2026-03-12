@@ -358,6 +358,52 @@ int32_t svp_ffmpeg_demuxer_stream_info(void *demuxerHandle, int32_t index, svp_f
 #endif
 }
 
+int32_t svp_ffmpeg_demuxer_stream_codec_config(void *demuxerHandle, int32_t index, svp_ffmpeg_codec_config_t *outConfig) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_demuxer *demuxer = (struct svp_ffmpeg_demuxer *)demuxerHandle;
+    AVStream *stream;
+    AVCodecParameters *codecPar;
+
+    if (demuxer == NULL || demuxer->format_ctx == NULL || outConfig == NULL) {
+        return -1;
+    }
+    memset(outConfig, 0, sizeof(*outConfig));
+    if (index < 0 || index >= (int32_t)demuxer->format_ctx->nb_streams) {
+        return -2;
+    }
+
+    stream = demuxer->format_ctx->streams[index];
+    codecPar = stream != NULL ? stream->codecpar : NULL;
+    if (codecPar == NULL || codecPar->extradata == NULL || codecPar->extradata_size <= 0) {
+        return 0;
+    }
+
+    outConfig->data = (uint8_t *)malloc((size_t)codecPar->extradata_size);
+    if (outConfig->data == NULL) {
+        return -12;
+    }
+    memcpy(outConfig->data, codecPar->extradata, (size_t)codecPar->extradata_size);
+    outConfig->size = codecPar->extradata_size;
+    return 1;
+#else
+    (void)demuxerHandle;
+    (void)index;
+    (void)outConfig;
+    return -38;
+#endif
+}
+
+void svp_ffmpeg_codec_config_release(svp_ffmpeg_codec_config_t *config) {
+    if (config == NULL) {
+        return;
+    }
+    if (config->data != NULL) {
+        free(config->data);
+        config->data = NULL;
+    }
+    config->size = 0;
+}
+
 int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_packet_t *outPacket) {
 #if SVP_HAS_VENDOR_FFMPEG
     struct svp_ffmpeg_demuxer *demuxer = (struct svp_ffmpeg_demuxer *)demuxerHandle;
@@ -771,7 +817,7 @@ static int32_t send_audio_packet(
 }
 #endif
 
-void *svp_ffmpeg_audio_decoder_create(int32_t codecID) {
+void *svp_ffmpeg_audio_decoder_create_with_extradata(int32_t codecID, const uint8_t *data, int32_t length) {
 #if SVP_HAS_VENDOR_FFMPEG
     const int ffCodecID = map_codec_id(codecID);
     const AVCodec *codec;
@@ -795,6 +841,15 @@ void *svp_ffmpeg_audio_decoder_create(int32_t codecID) {
         free_audio_decoder(decoder);
         return NULL;
     }
+    if (data != NULL && length > 0) {
+        decoder->codec_ctx->extradata = (uint8_t *)av_mallocz((size_t)length + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (decoder->codec_ctx->extradata == NULL) {
+            free_audio_decoder(decoder);
+            return NULL;
+        }
+        memcpy(decoder->codec_ctx->extradata, data, (size_t)length);
+        decoder->codec_ctx->extradata_size = length;
+    }
     if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
         free_audio_decoder(decoder);
         return NULL;
@@ -814,8 +869,14 @@ void *svp_ffmpeg_audio_decoder_create(int32_t codecID) {
     return decoder;
 #else
     (void)codecID;
+    (void)data;
+    (void)length;
     return NULL;
 #endif
+}
+
+void *svp_ffmpeg_audio_decoder_create(int32_t codecID) {
+    return svp_ffmpeg_audio_decoder_create_with_extradata(codecID, NULL, 0);
 }
 
 void svp_ffmpeg_audio_decoder_destroy(void *decoderHandle) {

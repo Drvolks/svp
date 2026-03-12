@@ -74,6 +74,7 @@ public actor PlaybackSession: PlayerEngine {
     private let liveVideoPacketBacklogSoftLimitSeconds: Double = 1.20
     private let liveFrameBacklogSoftLimitSeconds: Double = 0.35
     private let liveVideoDecodeLeadSoftLimitSeconds: Double = 0.18
+    private let splitAudioPacketBacklogSoftLimitSeconds: Double = 0.35
 
     public init(
         clock: MediaClock = MediaClock(),
@@ -264,6 +265,7 @@ public actor PlaybackSession: PlayerEngine {
                         }
                     }
                 case .aac, .ac3, .eac3, .opus:
+                    try? await throttleSplitAudioIngestionIfNeeded()
                     _ = await audioPacketQueue.enqueue(packet)
                 case .unknown:
                     continue
@@ -330,7 +332,9 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func throttleLiveIngestionIfNeeded() async throws {
-        guard sourceDescriptor?.isLive == true else { return }
+        guard let descriptor = sourceDescriptor else { return }
+        let isLive = descriptor.isLive
+        guard isLive else { return }
 
         while !Task.isCancelled {
             let audio = await audioPacketQueue.snapshot()
@@ -349,6 +353,25 @@ public actor PlaybackSession: PlayerEngine {
             guard shouldThrottle else { return }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+    }
+
+    private func throttleSplitAudioIngestionIfNeeded() async throws {
+        guard isSplitSourceDescriptor(sourceDescriptor) else { return }
+
+        while !Task.isCancelled {
+            let audio = await audioPacketQueue.snapshot()
+            let audioBacklog = audio.mediaSpanSeconds ?? 0
+            guard audioBacklog > splitAudioPacketBacklogSoftLimitSeconds else { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func isSplitSourceDescriptor(_ descriptor: MediaSourceDescriptor?) -> Bool {
+        guard let descriptor else { return false }
+        if case .split = descriptor.kind {
+            return true
+        }
+        return false
     }
 
     private func syncAudioMasterClock(with audioPTS: CMTime) {
@@ -487,6 +510,9 @@ public actor PlaybackSession: PlayerEngine {
             case .segmented:
                 hasAudio = true
                 hasVideo = true
+            case .split:
+                hasAudio = true
+                hasVideo = true
             case .file, .network:
                 hasAudio = descriptor.preferredClock == .audio
                 hasVideo = true
@@ -496,9 +522,13 @@ public actor PlaybackSession: PlayerEngine {
             hasVideo = descriptor.streams.contains { $0.kind == .video }
         }
 
+        let isSplitSource = isSplitSourceDescriptor(descriptor)
+
         let audioCapacity: Int
         if descriptor.isLive {
             audioCapacity = 512
+        } else if isSplitSource {
+            audioCapacity = 96
         } else {
             audioCapacity = 256
         }
@@ -548,6 +578,15 @@ public actor PlaybackSession: PlayerEngine {
             guard let self else { return }
             await self.decodeVideoPackets()
         }
+        let preferredLeadSeconds: Double
+        let useLivePresentation = sourceDescriptor?.isLive == true
+        if sourceDescriptor?.isLive == true {
+            preferredLeadSeconds = 0.08
+        } else if isSplitSourceDescriptor(sourceDescriptor) {
+            preferredLeadSeconds = 0.04
+        } else {
+            preferredLeadSeconds = 0.0
+        }
         videoPresentTask = Task { [weak self] in
             guard let self else { return }
             await self.videoPresenter.presentFrames(
@@ -560,7 +599,8 @@ public actor PlaybackSession: PlayerEngine {
                     guard let self else { return nil }
                     return await self.currentAudioClockForPresentation()
                 },
-                preferredLeadSeconds: sourceDescriptor?.isLive == true ? 0.08 : 0.0,
+                preferredLeadSeconds: preferredLeadSeconds,
+                useLivePresentation: useLivePresentation,
                 renderHealthLogger: { [weak self] context, framePTS, decodeElapsedMs, renderElapsedMs, queueWaitMs, audioLeadMs in
                     guard let self else { return }
                     await self.logVideoRenderHealth(
@@ -693,6 +733,9 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func shouldDropLateVideoFrameAsync(_ framePTS: CMTime) -> Bool {
+        guard sourceDescriptor?.isLive == true else {
+            return false
+        }
         guard framePTS.isValid,
               let audioPTS = currentAudioClockForPresentation(),
               audioPTS.isValid else {
@@ -928,9 +971,10 @@ private actor VideoPresenter {
         shouldDropLateFrame: @escaping @Sendable (CMTime) async -> Bool,
         masterClockProvider: @escaping @Sendable () async -> CMTime?,
         preferredLeadSeconds: Double,
+        useLivePresentation: Bool,
         renderHealthLogger: @escaping @Sendable (String, CMTime, Double, Double, Double, Double?) async -> Void
     ) async {
-        if preferredLeadSeconds > 0 {
+        if useLivePresentation {
             await presentLiveFrames(
                 from: frameQueue,
                 shouldDropLateFrame: shouldDropLateFrame,

@@ -7,7 +7,12 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            TextField("https://...", text: $viewModel.urlText)
+            TextField("Video URL", text: $viewModel.urlText)
+                .textInputAutocapitalization(.never)
+                .disableAutocorrection(true)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("Audio URL (optional)", text: $viewModel.audioURLText)
                 .textInputAutocapitalization(.never)
                 .disableAutocorrection(true)
                 .textFieldStyle(.roundedBorder)
@@ -39,6 +44,9 @@ struct ContentView: View {
                 .lineLimit(3)
         }
         .padding()
+        .task {
+            await viewModel.autoStartIfNeeded()
+        }
         .overlay {
             PiPLayerHostView(pipLayer: viewModel.pipOutputLayer(), onAttached: nil)
                 .frame(width: 2, height: 2)

@@ -198,6 +198,78 @@ Verdict:
 Hypothèse:
 - Une vraie clock issue de `playerTime(forNodeTime:)` est meilleure que `lastAudioPTS`.
 
+### 25. Clock audio basée sur sampleTime relatif a l'ancre
+
+Hypothèse:
+- `playerTime.sampleTime` du `AVAudioPlayerNode` est absolu sur la timeline du node.
+- Si on l'ajoute directement a `anchorPTS`, on invente un drift progressif.
+
+Changement:
+- `AudioRenderer` stocke maintenant `playbackAnchorSampleTime`.
+- `currentPlaybackTime()` calcule:
+  - `elapsedSamples = playerTime.sampleTime - playbackAnchorSampleTime`
+  - puis `anchorPTS + elapsedSeconds`
+
+Symptome attendu:
+- `derivedPTS` ne doit plus partir plusieurs secondes devant la video split/VOD.
+- Le drift A/V progressif devrait baisser nettement.
+
+Verdict:
+- En cours.
+
+### 26. Split VOD ne doit pas utiliser le presenter live
+
+Hypothèse:
+- Le split A/V VOD passe dans `presentLiveFrames(...)` uniquement parce que `preferredLeadSeconds > 0`.
+- Ce chemin ignore l'horloge audio et cadence sur l'ancre vidéo, donc drift assuré.
+
+Changement:
+- Le choix `live presenter` dépend maintenant de `descriptor.isLive`, pas seulement de `preferredLeadSeconds`.
+- Le split VOD garde un `preferredLeadSeconds` faible, mais passe par `pace(...)` avec `masterClockProvider`.
+
+Symptome attendu:
+- Moins de drift progressif sur `videoURL + audioURL`.
+- Plus de cohérence entre `audioClock` et `framePTS`.
+
+Verdict:
+- En cours.
+
+### 27. Filtrage explicite des streams en mode split
+
+Hypothèse:
+- L'URL "video" peut contenir aussi de l'audio, et l'URL "audio" ne doit fournir que l'audio.
+- Fusionner tous les streams des deux demuxers pollue le split A/V et peut créer du drift.
+
+Changement:
+- `SplitAVDemuxEngine` forwarde maintenant:
+  - seulement `.h264/.hevc` depuis le demux video
+  - seulement `.aac/.ac3/.eac3/.opus` depuis le demux audio
+
+Symptome attendu:
+- Split A/V plus cohérent.
+- Moins de dérive liée à des packets audio dupliqués ou mélangés.
+
+Verdict:
+- En cours.
+
+### 28. Instrumentation de la fusion split
+
+Hypothèse:
+- Le gel split peut venir d'un côté (audio ou vidéo) qui atteint EOF ou cesse de forwarder bien avant l'autre.
+
+Changement:
+- `SplitAVDemuxEngine` loggue maintenant:
+  - `video_forward`
+  - `audio_forward`
+  - `video_eof`
+  - `audio_eof`
+
+Symptome attendu:
+- Permettre d'identifier si le split casse dans la fusion ou plus bas dans le pipeline.
+
+Verdict:
+- En cours.
+
 Résultat actuel:
 - La formule instrumentée semble cohérente en elle-même:
   - `anchorPTS=-0.021`
@@ -258,6 +330,57 @@ Log utilisateur:
 
 Interprétation:
 - La formule `anchorPTS + sampleTime/sampleRate` semble raisonnable.
+
+### 23. Politique split A/V dédiée
+
+Hypothèse:
+- Une source `videoURL + audioURL` n'est pas un VOD muxé classique.
+- Sans politique dédiée, l'audio peut prendre plusieurs secondes d'avance en queue et la vidéo finit par s'enfarger.
+
+Changement:
+- Source `.split`:
+  - `audioCapacity = 96`
+  - backpressure dédié:
+    - audio `0.35s`
+    - video packets `0.80s`
+    - video frames `0.25s`
+  - pacing vidéo léger sur clock audio avec `preferredLeadSeconds = 0.04`
+
+Résultat attendu:
+- Moins de dette audio.
+- Moins de drift progressif.
+- Split MP4 plus stable sur la durée.
+
+Statut:
+- En test.
+
+Observation:
+- Le throttling global d'ingestion appliqué au mode split a empiré les choses.
+- Comme audio et vidéo arrivent via un flux fusionné, freiner l'ingestion entière dès que l'audio dépasse un petit seuil affame directement la vidéo.
+
+Verdict partiel:
+- Garder la capacité audio split plus basse.
+- Ne pas appliquer `throttleLiveIngestionIfNeeded()` au split.
+
+### 24. Backpressure audio split ciblé
+
+Hypothèse:
+- En split A/V, seule la queue audio dérive fortement.
+- Freiner toute l'ingestion casse la vidéo.
+- Il faut donc temporiser uniquement l'enqueue des paquets audio split.
+
+Changement:
+- Ajout de `throttleSplitAudioIngestionIfNeeded()`.
+- Appliqué seulement avant `audioPacketQueue.enqueue(packet)` pour les sources `.split`.
+- Seuil: `splitAudioPacketBacklogSoftLimitSeconds = 0.35`.
+
+Résultat attendu:
+- Moins de backlog audio split.
+- Moins de drift A/V.
+- Pas d'affamement vidéo.
+
+Statut:
+- En test.
 
 ### 19. Pacing audio avant render
 

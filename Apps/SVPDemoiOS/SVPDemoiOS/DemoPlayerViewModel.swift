@@ -17,7 +17,8 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
         var id: String { rawValue }
     }
 
-    @Published var urlText = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4"
+    @Published var urlText = "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_adv_example_hevc/v6/prog_index.m3u8"
+    @Published var audioURLText = ""
     @Published var statusMessage = "Colle une URL MP4 puis appuie sur Load Video."
     @Published var isLoaded = false
     @Published var isPlaying = false
@@ -36,6 +37,7 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
     private var pipPossibleObservation: NSKeyValueObservation?
     private var player: Player?
     private var eventsTask: Task<Void, Never>?
+    private var didAutoStart = false
 
     var canUsePiP: Bool {
         pipController != nil && isLoaded
@@ -85,23 +87,44 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
     }
 
     func loadVideo() async {
-        guard let url = URL(string: urlText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            statusMessage = "URL invalide."
+        guard let videoURL = URL(string: urlText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            statusMessage = "URL video invalide."
             return
         }
 
         do {
             await teardownCurrentPlayerIfNeeded()
 
-            let source = try makeInputSource(url: url)
+            let videoSource = try makeInputSource(url: videoURL)
+            let trimmedAudioURL = audioURLText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let audioSource: (any InputSource)?
+            if trimmedAudioURL.isEmpty {
+                audioSource = nil
+            } else {
+                guard let audioURL = URL(string: trimmedAudioURL) else {
+                    statusMessage = "URL audio invalide."
+                    return
+                }
+                audioSource = try makeInputSource(url: audioURL)
+            }
+
+            let effectiveDescriptor: MediaSourceDescriptor
             renderer.setFixedPreferredFPS(nil)
-            renderer.setLockEstimatedPreferredFPS(source.descriptor.isLive)
-            let newPlayer = Player(source: source, preferHardwareDecode: true)
+            let newPlayer: Player
+            if let audioSource {
+                let splitSource = SplitAVInputSource(videoSource: videoSource, audioSource: audioSource)
+                effectiveDescriptor = splitSource.descriptor
+                newPlayer = Player(videoSource: videoSource, audioSource: audioSource, preferHardwareDecode: true)
+            } else {
+                effectiveDescriptor = videoSource.descriptor
+                newPlayer = Player(source: videoSource, preferHardwareDecode: true)
+            }
+            renderer.setLockEstimatedPreferredFPS(effectiveDescriptor.isLive)
             await newPlayer.attachVideoOutput(renderer)
             await newPlayer.attachVideoOutput(pipBridge)
             await newPlayer.attachVideoOutput(sampleBufferBridge)
 
-            let playableSource = PlayableSource(descriptor: source.descriptor)
+            let playableSource = PlayableSource(descriptor: effectiveDescriptor)
             try await newPlayer.load(playableSource)
 
             eventsTask?.cancel()
@@ -117,13 +140,23 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
             isLoaded = true
             isPlaying = false
             isEnded = false
-            statusMessage = "Vidéo chargée. Appuie sur Play Fullscreen."
+            statusMessage = audioSource == nil
+                ? "Video chargee. Appuie sur Play Fullscreen."
+                : "Video+audio charges. Appuie sur Play Fullscreen."
         } catch {
             isLoaded = false
             isPlaying = false
             isEnded = false
             statusMessage = "Erreur load/play: \(error)"
         }
+    }
+
+    func autoStartIfNeeded() async {
+        guard !didAutoStart else { return }
+        didAutoStart = true
+        await loadVideo()
+        guard isLoaded else { return }
+        await setPlayback(playing: true)
     }
 
     func togglePlayPause() async {

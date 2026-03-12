@@ -6,6 +6,7 @@ import PlayerCore
 public actor FFmpegAudioDecoder: AudioDecoder {
     private let handleBox = FFmpegAudioDecoderHandleBox()
     private var activeCodec: CodecID?
+    private var activeCodecConfig: Data?
 
     public init() {}
 
@@ -18,7 +19,7 @@ public actor FFmpegAudioDecoder: AudioDecoder {
             throw AudioDecodeError.backendUnavailable
         }
 
-        try ensureDecoder(codec: packet.formatHint)
+        try ensureDecoder(codec: packet.formatHint, codecConfig: packet.codecConfig)
         guard let handle = handleBox.raw else {
             throw AudioDecodeError.backendUnavailable
         }
@@ -61,18 +62,30 @@ public actor FFmpegAudioDecoder: AudioDecoder {
         _ = svp_ffmpeg_audio_decoder_flush(handle)
     }
 
-    private func ensureDecoder(codec: CodecID) throws {
-        if activeCodec != codec {
+    private func ensureDecoder(codec: CodecID, codecConfig: Data?) throws {
+        if activeCodec != codec || activeCodecConfig != codecConfig {
             if let handle = handleBox.raw {
                 svp_ffmpeg_audio_decoder_destroy(handle)
                 handleBox.raw = nil
             }
             activeCodec = codec
+            activeCodecConfig = codecConfig
         }
         if handleBox.raw != nil {
             return
         }
-        let created = svp_ffmpeg_audio_decoder_create(codecID(codec))
+        let created: UnsafeMutableRawPointer?
+        if let codecConfig, !codecConfig.isEmpty {
+            created = codecConfig.withUnsafeBytes { bytes in
+                svp_ffmpeg_audio_decoder_create_with_extradata(
+                    codecID(codec),
+                    bytes.bindMemory(to: UInt8.self).baseAddress,
+                    Int32(codecConfig.count)
+                )
+            }
+        } else {
+            created = svp_ffmpeg_audio_decoder_create(codecID(codec))
+        }
         guard let created else {
             throw AudioDecodeError.backendUnavailable
         }
