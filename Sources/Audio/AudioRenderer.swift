@@ -17,12 +17,12 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
 
         static let vod = PlaybackProfile(
             mode: "vod",
-            baseStartBufferSeconds: 0.180,
+            baseStartBufferSeconds: 0.150,
             maxStartBufferSeconds: 0.600,
             startBufferStepOnUnderrun: 0.080,
             rebufferLowWaterSeconds: 0.080,
             lowWaterHitsBeforeRebuffer: 4,
-            maxBufferedAudioSeconds: 2.50
+            maxBufferedAudioSeconds: 2.0
         )
 
         static let live = PlaybackProfile(
@@ -32,7 +32,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             startBufferStepOnUnderrun: 0.080,
             rebufferLowWaterSeconds: 0.050,
             lowWaterHitsBeforeRebuffer: 3,
-            maxBufferedAudioSeconds: 1.400
+            maxBufferedAudioSeconds: 1.40
         )
     }
 
@@ -117,6 +117,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                     playbackAnchorPTS = frame.pts
                     playbackAnchorSampleRate = format.sampleRate
                     playbackAnchorSampleTime = nil
+                    #if DEBUG
+                    print("[SVP][Audio] audioClockAnchor pts=\(frame.pts.seconds) sampleRate=\(format.sampleRate)")
+                    #endif
                 }
                 return queuedBufferSeconds
             }
@@ -131,7 +134,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 }
                 #if DEBUG
                 let state = lock.withLock { (wantsPlayback, queuedBufferSeconds, minStartBufferSeconds) }
-                print("[SVP][Audio] forced_playerNode_play_in_render wants=\(state.0) queued=\(state.1) target=\(state.2)")
+                print("[SVP][Audio] playerNode_start_now wants=\(state.0) queued=\(String(format: "%.3f", state.1)) target=\(String(format: "%.3f", state.2))")
                 #endif
             }
             if queuedAfterAppend > profile.maxBufferedAudioSeconds {
@@ -497,8 +500,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay])
-            try session.setPreferredSampleRate(48_000)
-            try session.setPreferredIOBufferDuration(0.023)
+            // Use larger buffer duration (46ms) to prevent HAL overload
+            // This reduces callback frequency and prevents the "skipping cycle due to overload" errors
+            try session.setPreferredIOBufferDuration(0.046)
             try session.setActive(true)
             #if DEBUG
             print("[SVP][Audio] session_config sampleRate=\(session.sampleRate) ioBuffer=\(session.ioBufferDuration)")

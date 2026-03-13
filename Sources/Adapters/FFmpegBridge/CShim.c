@@ -453,7 +453,7 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
 
     if (!g_svp_bridge_stamp_printed) {
         g_svp_bridge_stamp_printed = 1;
-        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T13:05\n");
+        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T15:00\n");
     }
 
     avformat_network_init();
@@ -836,8 +836,12 @@ void *svp_ffmpeg_video_decoder_create_with_extradata(int32_t codecID, const uint
      */
     decoder->codec_ctx->pkt_timebase.num = 1;
     decoder->codec_ctx->pkt_timebase.den = 90000;
-    decoder->codec_ctx->thread_count = 0;
-    decoder->codec_ctx->thread_type = FF_THREAD_FRAME;
+    /*
+     * Multi-threaded decoding for software decode (AV1, VP9, etc).
+     * Use 8 threads for parallel frame decoding on mobile devices.
+     */
+    decoder->codec_ctx->thread_count = 8;
+    decoder->codec_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
     if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
         free_decoder(decoder);

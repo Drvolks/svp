@@ -17,13 +17,16 @@ extension FFmpegDemuxError: PlaybackCategorizedError {
 }
 
 public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
-    private static let buildStamp = "SVP_LOCAL_2026-03-13T13:30"
+    private static let buildStamp = "SVP_LOCAL_2026-03-13T15:00"
+    private static let reorderBufferSize = 8
     private let url: URL
     private let handleBox = FFmpegDemuxerHandleBox()
     private var streamInfoByIndex: [Int32: svp_ffmpeg_stream_info_t] = [:]
     private var streamCodecConfigByIndex: [Int32: Data] = [:]
     private var loggedFirstPacket = false
     private var packetStreamGeneration: UInt64 = 0
+    // Reordering buffer to handle out-of-order packets from FFmpeg
+    private var reorderBuffer: [DemuxedPacket] = []
 
     public init(url: URL) {
         self.url = url
@@ -32,12 +35,15 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
     public func makePacketStream() -> AsyncThrowingStream<DemuxedPacket, Error> {
         packetStreamGeneration &+= 1
         let generation = packetStreamGeneration
+        let bufferSize = Self.reorderBufferSizeStatic
         return AsyncThrowingStream { continuation in
             let task = Task { [weak self] in
                 guard let self else {
                     continuation.finish()
                     return
                 }
+                // Clear reorder buffer from previous stream
+                await self.clearReorderBuffer()
                 do {
                     try await self.openIfNeeded()
                     guard await self.isPacketStreamGenerationCurrent(generation) else {
@@ -45,32 +51,53 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                         return
                     }
                     await self.log("packet_stream_started")
+                    var eofReached = false
+
                     while !Task.isCancelled {
                         guard await self.isPacketStreamGenerationCurrent(generation) else {
                             continuation.finish()
                             return
                         }
-                        guard let handle = self.handleBox.raw else {
-                            throw FFmpegDemuxError.openFailed(reason: "demux handle is nil after open")
+
+                        // Fill the reorder buffer if not full and haven't reached EOF
+                        var bufferCount = await self.getReorderBufferCount()
+                        while !eofReached && bufferCount < bufferSize {
+                            guard let handle = self.getHandle() else {
+                                throw FFmpegDemuxError.openFailed(reason: "demux handle is nil after open")
+                            }
+                            var rawPacket = svp_ffmpeg_demuxed_packet_t()
+                            let status = svp_ffmpeg_demuxer_read_packet(handle, &rawPacket)
+                            if status == 0 {
+                                await self.log("packet_stream_eof")
+                                eofReached = true
+                                break
+                            }
+                            if status < 0 {
+                                await self.log("read_packet_failed status=\(status)")
+                                throw FFmpegDemuxError.readFailed(status)
+                            }
+                            if let packet = await self.makePacket(from: rawPacket) {
+                                await self.addToReorderBuffer(packet)
+                            }
+                            bufferCount = await self.getReorderBufferCount()
                         }
-                        var rawPacket = svp_ffmpeg_demuxed_packet_t()
-                        let status = svp_ffmpeg_demuxer_read_packet(handle, &rawPacket)
-                        if status == 0 {
-                            await self.log("packet_stream_eof")
-                            continuation.finish()
-                            return
-                        }
-                        if status < 0 {
-                            await self.log("read_packet_failed status=\(status)")
-                            throw FFmpegDemuxError.readFailed(status)
-                        }
-                        if let packet = await self.makePacket(from: rawPacket) {
+
+                        // Sort and release packets in PTS order
+                        await self.sortReorderBuffer()
+                        if let packet = await self.popFromReorderBuffer() {
                             guard await self.isPacketStreamGenerationCurrent(generation) else {
                                 continuation.finish()
                                 return
                             }
                             await self.logFirstPacketIfNeeded(packet)
                             continuation.yield(packet)
+                        } else if eofReached {
+                            // Buffer empty and EOF reached, we're done
+                            continuation.finish()
+                            return
+                        } else {
+                            // Buffer empty but not EOF, need to read more
+                            try await Task.sleep(nanoseconds: 1_000_000) // 1ms
                         }
                     }
                     continuation.finish()
@@ -211,6 +238,41 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         }
     }
 
+    // MARK: - Reorder Buffer Helpers
+
+    private func clearReorderBuffer() {
+        reorderBuffer.removeAll()
+    }
+
+    private func getReorderBufferCount() -> Int {
+        reorderBuffer.count
+    }
+
+    private static var reorderBufferSizeStatic: Int {
+        Self.reorderBufferSize
+    }
+
+    private nonisolated func getHandle() -> UnsafeMutableRawPointer? {
+        handleBox.raw
+    }
+
+    private func addToReorderBuffer(_ packet: DemuxedPacket) {
+        reorderBuffer.append(packet)
+    }
+
+    private func sortReorderBuffer() {
+        reorderBuffer.sort { a, b in
+            let ptsA = a.pts ?? a.dts ?? .max
+            let ptsB = b.pts ?? b.dts ?? .max
+            return ptsA < ptsB
+        }
+    }
+
+    private func popFromReorderBuffer() -> DemuxedPacket? {
+        guard !reorderBuffer.isEmpty else { return nil }
+        return reorderBuffer.removeFirst()
+    }
+
     private func sourcePath(_ url: URL) -> String {
         if url.isFileURL {
             return url.path
@@ -236,7 +298,7 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
 }
 
 private final class FFmpegDemuxerHandleBox: @unchecked Sendable {
-    var raw: UnsafeMutableRawPointer?
+    nonisolated(unsafe) var raw: UnsafeMutableRawPointer?
 
     deinit {
         if let raw {

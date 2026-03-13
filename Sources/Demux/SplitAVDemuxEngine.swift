@@ -24,8 +24,9 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     continuation.finish()
                     return
                 }
-                var firstVideoPTS: Int64?
-                var firstAudioPTS: Int64?
+                var commonBaseline: Int64?
+                var pendingVideoPTS: Int64?
+                var pendingAudioPTS: Int64?
                 var lastVideoNormalizedPTS: Int64?
                 var lastAudioNormalizedPTS: Int64?
                 var forwardedVideoPackets = 0
@@ -35,6 +36,33 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     #if DEBUG
                     print("[SVP][SplitDemux] \(message)")
                     #endif
+                }
+
+                func logFirstPTS() {
+                    // Logging disabled - baseline is logged in establishCommonBaseline
+                }
+
+                func establishCommonBaseline(_ packet: DemuxedPacket, isVideo: Bool) {
+                    // Once baseline is established, never change it
+                    guard commonBaseline == nil else { return }
+
+                    let packetPTS = packet.pts ?? packet.dts ?? 0
+
+                    if isVideo {
+                        pendingVideoPTS = packetPTS
+                    } else {
+                        pendingAudioPTS = packetPTS
+                    }
+
+                    // Wait until we have packets from both streams before establishing baseline
+                    guard let videoPTS = pendingVideoPTS, let audioPTS = pendingAudioPTS else {
+                        return
+                    }
+
+                    // Use the minimum as baseline (earliest packet in timeline)
+                    commonBaseline = min(videoPTS, audioPTS)
+                    let b_sec = Double(commonBaseline!) / 90000.0
+                    log("baseline=\(String(format: "%.3f", b_sec)) video=\(Double(videoPTS)/90000.0) audio=\(Double(audioPTS)/90000.0)")
                 }
 
                 func isVideoPacket(_ packet: DemuxedPacket) -> Bool {
@@ -55,13 +83,16 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     }
                 }
 
-                func normalize(_ packet: DemuxedPacket, firstPTS: inout Int64?, streamIDOffset: Int) -> DemuxedPacket {
-                    let baseline = firstPTS ?? packet.pts ?? packet.dts ?? 0
-                    if firstPTS == nil {
-                        firstPTS = baseline
-                    }
+                func normalize(_ packet: DemuxedPacket, isVideo: Bool, streamIDOffset: Int) -> DemuxedPacket {
+                    establishCommonBaseline(packet, isVideo: isVideo)
+                    let baseline = commonBaseline ?? packet.pts ?? packet.dts ?? 0
                     let normalizedPTS = packet.pts.map { max(0, $0 - baseline) }
                     let normalizedDTS = packet.dts.map { max(0, $0 - baseline) }
+                    #if DEBUG
+                    if forwardedVideoPackets == 1 || forwardedAudioPackets == 1 {
+                        log("normalize origPts=\(String(describing: packet.pts)) normalized=\(String(describing: normalizedPTS)) baseline=\(baseline)")
+                    }
+                    #endif
                     return DemuxedPacket(
                         streamID: StreamID(packet.streamID.rawValue + streamIDOffset),
                         pts: normalizedPTS,
@@ -78,12 +109,12 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
 
                 func normalizeWithFallback(
                     _ packet: DemuxedPacket,
-                    firstPTS: inout Int64?,
+                    isVideo: Bool,
                     lastPTS: inout Int64?,
                     streamIDOffset: Int,
                     defaultStep90k: Int64
                 ) -> DemuxedPacket {
-                    let normalized = normalize(packet, firstPTS: &firstPTS, streamIDOffset: streamIDOffset)
+                    let normalized = normalize(packet, isVideo: isVideo, streamIDOffset: streamIDOffset)
                     var pts = normalized.pts
                     var dts = normalized.dts
 
@@ -142,7 +173,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         guard isVideoPacket(packet) else { continue }
                         let normalized = normalizeWithFallback(
                             packet,
-                            firstPTS: &firstVideoPTS,
+                            isVideo: true,
                             lastPTS: &lastVideoNormalizedPTS,
                             streamIDOffset: videoStreamIDOffset,
                             defaultStep90k: 3_003
@@ -150,6 +181,9 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         forwardedVideoPackets += 1
                         if forwardedVideoPackets == 1 || forwardedVideoPackets % 300 == 0 {
                             log("video_forward count=\(forwardedVideoPackets) pts=\(String(describing: normalized.pts))")
+                        }
+                        if forwardedVideoPackets == 1 {
+                            logFirstPTS()
                         }
                         return normalized
                     }
@@ -171,7 +205,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         guard isAudioPacket(packet) else { continue }
                         let normalized = normalizeWithFallback(
                             packet,
-                            firstPTS: &firstAudioPTS,
+                            isVideo: false,
                             lastPTS: &lastAudioNormalizedPTS,
                             streamIDOffset: audioStreamIDOffset,
                             defaultStep90k: 2_088
@@ -179,6 +213,9 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         forwardedAudioPackets += 1
                         if forwardedAudioPackets == 1 || forwardedAudioPackets % 300 == 0 {
                             log("audio_forward count=\(forwardedAudioPackets) pts=\(String(describing: normalized.pts))")
+                        }
+                        if forwardedAudioPackets == 1 {
+                            logFirstPTS()
                         }
                         return normalized
                     }

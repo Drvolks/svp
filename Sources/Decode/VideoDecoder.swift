@@ -93,6 +93,7 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
         guard preferHardware else { return false }
         switch codec {
         case .av1, .vp9:
+            // Use software decode for these codecs (hardware may not support them on all devices)
             return true
         default:
             return false

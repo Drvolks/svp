@@ -264,6 +264,9 @@ public actor PlaybackSession: PlayerEngine {
                 }
                 switch packet.formatHint {
                 case .h264, .hevc, .av1, .vp9:
+                    #if DEBUG
+                    print("[SVP] video_packet_enqueue pts=\(String(describing: packet.pts))")
+                    #endif
                     if !(await videoPacketQueue.enqueue(packet)) {
                         droppedVideoPackets += 1
                         if droppedVideoPackets == 1 || droppedVideoPackets % 30 == 0 {
@@ -547,9 +550,10 @@ public actor PlaybackSession: PlayerEngine {
         let videoFrameCapacity: Int
         let videoFrameOverflowPolicy: FrameQueueOverflowPolicy
         if descriptor.isLive {
-            videoCapacity = hasAudio ? 180 : 240
+            // Increased for better buffering in live mode
+            videoCapacity = hasAudio ? 240 : 360
             videoOverflowPolicy = .preferKeyframes
-            videoFrameCapacity = hasAudio ? 18 : 24
+            videoFrameCapacity = hasAudio ? 24 : 36
             videoFrameOverflowPolicy = .blockProducer
         } else if isSplitSource && hasAudio {
             // Split VOD (separate video/audio URLs): keep packet ordering stable
@@ -599,7 +603,9 @@ public actor PlaybackSession: PlayerEngine {
         if sourceDescriptor?.isLive == true {
             preferredLeadSeconds = 0.08
         } else if isSplitSourceDescriptor(sourceDescriptor) {
-            preferredLeadSeconds = 0.04
+            // Moderate lead for split AV - allows video to run slightly ahead of audio
+            // for buffering headroom while keeping sync
+            preferredLeadSeconds = 0.2
         } else {
             preferredLeadSeconds = 0.0
         }
@@ -666,7 +672,13 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func decodeVideoPackets(generation: UInt64) async {
+        #if DEBUG
+        print("[SVP] video_decode_loop starting")
+        #endif
         while let packet = await videoPacketQueue.dequeue() {
+            #if DEBUG
+            print("[SVP] video_decode_loop dequeue pts=\(String(describing: packet.pts))")
+            #endif
             if Task.isCancelled || !isGenerationCurrent(generation) { return }
             if waitingForVideoKeyframeResync {
                 guard packet.isKeyframe else { continue }
@@ -685,6 +697,9 @@ public actor PlaybackSession: PlayerEngine {
             do {
                 let decodeStart = ProcessInfo.processInfo.systemUptime
                 if let frame = try await videoPipeline.decode(packet: packet) {
+                    #if DEBUG
+                    print("[SVP] video_decode returned frame pts=\(String(describing: frame.pts))")
+                    #endif
                     let decodeElapsedMs = (ProcessInfo.processInfo.systemUptime - decodeStart) * 1000
                     guard frame.pixelBuffer != nil else {
                         throw PlaybackSessionError.renderOutputMissing
@@ -701,12 +716,18 @@ public actor PlaybackSession: PlayerEngine {
                     lastDecodedVideoFramePTS = frame.pts
                     lastDecodedVideoFrameUptime = ProcessInfo.processInfo.systemUptime
                     lastVideoDecodeElapsedMs = decodeElapsedMs
+                    #if DEBUG
+                    print("[SVP][VideoDecode] enqueue pts=\(String(format: "%.3f", frame.pts.seconds))")
+                    #endif
                     if !(await videoFrameQueue.enqueue(instrumentedFrame)) {
                         return
                     }
                     consecutiveVideoDecodeFailures = 0
                 }
             } catch {
+                #if DEBUG
+                print("[SVP] video_decode_error error=\(error)")
+                #endif
                 if Task.isCancelled { return }
                 consecutiveVideoDecodeFailures += 1
                 diagnostics.incrementDecodeFailure()
@@ -1064,6 +1085,14 @@ private actor VideoPresenter {
             }
             if Task.isCancelled { return }
             do {
+                #if DEBUG
+                let audioClockNow = await masterClockProvider()
+                let framePTS_sec = frame.pts.seconds
+                let audioPTS_sec = audioClockNow?.seconds ?? -1
+                if renderedVideoFrameCount < 5 {
+                    print("[SVP][VideoPresent] framePTS=\(String(format: "%.3f", framePTS_sec)) audioPTS=\(String(format: "%.3f", audioPTS_sec)) lead=\(String(format: "%.3f", framePTS_sec - audioPTS_sec))")
+                }
+                #endif
                 if await shouldDropLateFrame(frame.pts) {
                     continue
                 }
@@ -1225,7 +1254,11 @@ private actor VideoPresenter {
         let targetLead = max(0, preferredLeadSeconds)
         if targetLead > 0 {
             while !Task.isCancelled {
-                guard let masterClock = await masterClockProvider(), masterClock.isValid else { break }
+                guard let masterClock = await masterClockProvider(), masterClock.isValid else {
+                    // Audio clock not available yet - skip pacing and render immediately
+                    // This prevents deadlock when audio hasn't started playing (pre-buffer period)
+                    break
+                }
                 let lead = framePTS.seconds - masterClock.seconds
                 let sleepSeconds = lead - targetLead
                 if sleepSeconds <= 0.01 {
