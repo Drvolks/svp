@@ -1,6 +1,8 @@
 source=https://github.com/FFmpeg/FFmpeg.git
 ref=n8.0.1
 profile=lgpl
+profile_flags=av1-explicit
+dav1d_ref=1.1.0
 ios_min=15.0
 tvos_min=15.0
 macos_min=13.0
