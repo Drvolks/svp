@@ -42,13 +42,12 @@ struct AVSmokeRunner {
             videoURL = parsedVideoURL
             audioURL = parsedAudioURL
         } else {
-            guard let bundledVideoURL = Bundle.module.url(forResource: "1-h264", withExtension: "mp4"),
-                  let bundledAudioURL = Bundle.module.url(forResource: "1-h264", withExtension: "aac") else {
-                fputs("missing bundled AVSmoke fixtures\n", stderr)
+            guard let fixtureURLs = defaultFixtureURLs() else {
+                fputs("missing AVSmoke fixtures; pass <videoURLOrPath> <audioURLOrPath> as arguments\n", stderr)
                 Foundation.exit(2)
             }
-            videoURL = bundledVideoURL
-            audioURL = bundledAudioURL
+            videoURL = fixtureURLs.video
+            audioURL = fixtureURLs.audio
         }
 
         let durationSeconds: Double
@@ -148,6 +147,26 @@ struct AVSmokeRunner {
             return FileInputSource(url: url)
         }
         return HTTPInputSource(url: url)
+    }
+
+    static func defaultFixtureURLs() -> (video: URL, audio: URL)? {
+        let fm = FileManager.default
+        let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
+
+        let candidateDirectories: [URL] = [
+            cwd.appendingPathComponent("Sources/AVSmoke", isDirectory: true),
+            cwd.appendingPathComponent("AVSmoke", isDirectory: true),
+            cwd
+        ]
+
+        for directory in candidateDirectories {
+            let video = directory.appendingPathComponent("1-h264.mp4")
+            let audio = directory.appendingPathComponent("1-h264.aac")
+            if fm.fileExists(atPath: video.path), fm.fileExists(atPath: audio.path) {
+                return (video, audio)
+            }
+        }
+        return nil
     }
 }
 

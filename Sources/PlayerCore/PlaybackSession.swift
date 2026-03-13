@@ -542,6 +542,13 @@ public actor PlaybackSession: PlayerEngine {
             videoOverflowPolicy = .preferKeyframes
             videoFrameCapacity = hasAudio ? 18 : 24
             videoFrameOverflowPolicy = .blockProducer
+        } else if isSplitSource && hasAudio {
+            // Split VOD (separate video/audio URLs): keep packet ordering stable
+            // while allowing late frame replacement at the presentation stage.
+            videoCapacity = 180
+            videoOverflowPolicy = .blockProducer
+            videoFrameCapacity = 24
+            videoFrameOverflowPolicy = .dropOldest
         } else {
             videoCapacity = hasAudio ? 240 : 600
             videoOverflowPolicy = .blockProducer
@@ -629,7 +636,6 @@ public actor PlaybackSession: PlayerEngine {
                         diagnostics.log("first_audio_frame pts=\(frame.pts.seconds)")
                     }
                     syncAudioMasterClock(with: frame.pts)
-                    try await paceAudioIfNeeded(framePTS: frame.pts)
                     for output in audioOutputs.values {
                         output.render(frame: frame)
                     }
@@ -733,24 +739,32 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func shouldDropLateVideoFrameAsync(_ framePTS: CMTime) -> Bool {
-        guard sourceDescriptor?.isLive == true else {
-            return false
-        }
         guard framePTS.isValid,
               let audioPTS = currentAudioClockForPresentation(),
               audioPTS.isValid else {
             return false
         }
-        return (audioPTS - framePTS).seconds > 0.200
+        let lagSeconds = (audioPTS - framePTS).seconds
+        if sourceDescriptor?.isLive == true {
+            return lagSeconds > 0.200
+        }
+        // For VOD, allow some lag but don't let frame backlog grow indefinitely.
+        return lagSeconds > 0.300
     }
 
     private func currentAudioClockForPresentation() -> CMTime? {
+        var hasPlaybackClockProvider = false
         for output in audioOutputs.values {
-            if let provider = output as? any AudioPlaybackClockProviding,
-               let playbackTime = provider.currentPlaybackTime(),
-               playbackTime.isValid {
-                return playbackTime
+            if let provider = output as? any AudioPlaybackClockProviding {
+                hasPlaybackClockProvider = true
+                if let playbackTime = provider.currentPlaybackTime(),
+                   playbackTime.isValid {
+                    return playbackTime
+                }
             }
+        }
+        if hasPlaybackClockProvider {
+            return nil
         }
         return lastAudioPTS
     }
@@ -986,7 +1000,29 @@ private actor VideoPresenter {
         }
 
         while !Task.isCancelled {
-            guard let frame = await frameQueue.dequeue() else { break }
+            let frame: DecodedVideoFrame
+            if let masterClock = await masterClockProvider(), masterClock.isValid {
+                let lead = max(0.04, preferredLeadSeconds)
+                let maxPTS = masterClock + CMTime(seconds: lead, preferredTimescale: 90_000)
+                let pop = await frameQueue.popLatestEligible(upTo: maxPTS)
+                if pop.droppedCount > 0 {
+                    diagnostics.log("video_present_drop_stale count=\(pop.droppedCount)")
+                }
+                if let eligible = pop.frame {
+                    frame = eligible
+                } else {
+                    let snapshot = await frameQueue.snapshot()
+                    if let firstPTS = snapshot.firstPTSSeconds, firstPTS > maxPTS.seconds {
+                        try? await Task.sleep(nanoseconds: 5_000_000)
+                        continue
+                    }
+                    guard let dequeued = await frameQueue.dequeue() else { break }
+                    frame = dequeued
+                }
+            } else {
+                guard let dequeued = await frameQueue.dequeue() else { break }
+                frame = dequeued
+            }
             if Task.isCancelled { return }
             do {
                 if await shouldDropLateFrame(frame.pts) {

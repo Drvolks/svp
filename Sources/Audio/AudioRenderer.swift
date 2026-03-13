@@ -17,9 +17,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
 
         static let vod = PlaybackProfile(
             mode: "vod",
-            baseStartBufferSeconds: 0.650,
-            maxStartBufferSeconds: 1.200,
-            startBufferStepOnUnderrun: 0.120,
+            baseStartBufferSeconds: 0.180,
+            maxStartBufferSeconds: 0.600,
+            startBufferStepOnUnderrun: 0.080,
             rebufferLowWaterSeconds: 0.080,
             lowWaterHitsBeforeRebuffer: 4,
             maxBufferedAudioSeconds: 2.50
@@ -45,8 +45,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     private var underrunCount = 0
     private var lowWaterHitCount = 0
     private var queuedBufferSeconds: Double = 0
+    private var hasStartedPlayerNode = false
     private var profile = PlaybackProfile.vod
-    private var minStartBufferSeconds: Double = 0.650
+    private var minStartBufferSeconds: Double = 0.180
     private let enableActiveRebuffer: Bool = false
     private var isRebuffering = true
     private var playbackAnchorPTS: CMTime?
@@ -80,7 +81,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     }
 
     public func render(frame: DecodedAudioFrame) {
-        let shouldPlay = lock.withLock {
+        _ = lock.withLock {
             renderedFrames += 1
             if !loggedFirstRender {
                 loggedFirstRender = true
@@ -89,11 +90,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 print("[SVP][Audio] jitter_buffer mode=\(profile.mode) start=\(minStartBufferSeconds)s base=\(profile.baseStartBufferSeconds)s max=\(profile.maxStartBufferSeconds)s lowWater=\(profile.rebufferLowWaterSeconds)s lowHits=\(profile.lowWaterHitsBeforeRebuffer)s maxBuffered=\(profile.maxBufferedAudioSeconds)s callback=dataPlayedBack")
                 #endif
             }
-            return wantsPlayback
         }
 
         #if canImport(AVFoundation)
-        guard shouldPlay else { return }
         do {
             try configureIfNeeded(for: frame)
             guard let format = configuredFormat else { return }
@@ -121,6 +120,20 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 }
                 return queuedBufferSeconds
             }
+            let shouldForceStart = lock.withLock { () -> Bool in
+                !hasStartedPlayerNode && queuedBufferSeconds >= minStartBufferSeconds
+            }
+            if shouldForceStart && !playerNode.isPlaying {
+                playerNode.play()
+                lock.withLock {
+                    hasStartedPlayerNode = true
+                    isRebuffering = false
+                }
+                #if DEBUG
+                let state = lock.withLock { (wantsPlayback, queuedBufferSeconds, minStartBufferSeconds) }
+                print("[SVP][Audio] forced_playerNode_play_in_render wants=\(state.0) queued=\(state.1) target=\(state.2)")
+                #endif
+            }
             if queuedAfterAppend > profile.maxBufferedAudioSeconds {
                 lock.withLock {
                     queuedBufferSeconds = max(0, queuedBufferSeconds - bufferSeconds)
@@ -134,6 +147,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             playerNode.scheduleBuffer(pcmBuffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
                 guard let self else { return }
                 self.lock.withLock {
+                    guard self.hasStartedPlayerNode else { return }
                     self.queuedBufferSeconds = max(0, self.queuedBufferSeconds - bufferSeconds)
                 }
             }
@@ -195,6 +209,8 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         lock.withLock {
             wantsPlayback = false
             isRebuffering = true
+            hasStartedPlayerNode = false
+            queuedBufferSeconds = 0
         }
         #if DEBUG
         print("[SVP][Audio] handlePause")
@@ -208,6 +224,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         lock.withLock {
             wantsPlayback = false
             queuedBufferSeconds = 0
+            hasStartedPlayerNode = false
             isRebuffering = true
             minStartBufferSeconds = profile.baseStartBufferSeconds
             lowWaterHitCount = 0
@@ -399,16 +416,47 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     }
 
     private func maybeStartPlaybackIfReady(logContext: String) {
-        let state = lock.withLock { (wantsPlayback, queuedBufferSeconds, isRebuffering, minStartBufferSeconds) }
+        let state = lock.withLock { (wantsPlayback, queuedBufferSeconds, isRebuffering, minStartBufferSeconds, hasStartedPlayerNode) }
         let shouldPlay = state.0
         guard shouldPlay else { return }
+        if playerNode.isPlaying {
+            lock.withLock {
+                hasStartedPlayerNode = true
+                isRebuffering = false
+            }
+            return
+        }
         let queuedSeconds = state.1
         let rebuffering = state.2
         let requiredBufferSeconds = state.3
-        guard queuedSeconds >= requiredBufferSeconds else { return }
+        let startedBefore = state.4
+
+        // If playback was already started once, resume immediately when any
+        // audio is queued instead of waiting for the full startup threshold.
+        if startedBefore && queuedSeconds > 0 {
+            playerNode.play()
+            lock.withLock {
+                hasStartedPlayerNode = true
+                isRebuffering = false
+            }
+            #if DEBUG
+            print("[SVP][Audio] playerNode_resume_in_\(logContext) queued=\(queuedSeconds)")
+            #endif
+            return
+        }
+
+        guard queuedSeconds >= requiredBufferSeconds else {
+            #if DEBUG
+            if queuedSeconds > 0 {
+                print("[SVP][Audio] start_wait_in_\(logContext) queued=\(queuedSeconds) target=\(requiredBufferSeconds)")
+            }
+            #endif
+            return
+        }
         if !playerNode.isPlaying {
             playerNode.play()
             lock.withLock {
+                hasStartedPlayerNode = true
                 isRebuffering = false
             }
             #if DEBUG

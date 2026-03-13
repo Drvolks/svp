@@ -34,6 +34,9 @@ typedef struct svp_ffmpeg_demuxed_packet {
     int64_t duration;
     uint8_t *data;
     int32_t size;
+    int32_t sideDataType;
+    uint8_t *sideData;
+    int32_t sideDataSize;
 } svp_ffmpeg_demuxed_packet_t;
 
 typedef struct svp_ffmpeg_codec_config {
@@ -65,6 +68,7 @@ double svp_ffmpeg_demuxer_duration_seconds(void *demuxer);
 void svp_ffmpeg_demuxed_packet_release(svp_ffmpeg_demuxed_packet_t *packet);
 void svp_ffmpeg_codec_config_release(svp_ffmpeg_codec_config_t *config);
 void *svp_ffmpeg_video_decoder_create(int32_t codecID);
+void *svp_ffmpeg_video_decoder_create_with_extradata(int32_t codecID, const uint8_t *data, int32_t length);
 void svp_ffmpeg_video_decoder_destroy(void *decoder);
 int32_t svp_ffmpeg_video_decoder_flush(void *decoder);
 int32_t svp_ffmpeg_video_decoder_decode(
@@ -72,6 +76,9 @@ int32_t svp_ffmpeg_video_decoder_decode(
     const uint8_t *data,
     int32_t length,
     int64_t pts90k,
+    int32_t sideDataType,
+    const uint8_t *sideData,
+    int32_t sideDataSize,
     svp_ffmpeg_decoded_frame_t *outFrame
 );
 void svp_ffmpeg_decoded_frame_release(svp_ffmpeg_decoded_frame_t *frame);

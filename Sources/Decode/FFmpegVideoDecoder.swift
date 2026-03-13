@@ -7,6 +7,7 @@ import PlayerCore
 public actor FFmpegVideoDecoder: VideoDecoder {
     private let handleBox = FFmpegDecoderHandleBox()
     private var activeCodec: CodecID?
+    private var activeCodecConfig: Data?
 
     public init() {}
 
@@ -24,22 +25,44 @@ public actor FFmpegVideoDecoder: VideoDecoder {
             throw VideoDecodeError.backendUnavailable
         }
 
-        try ensureDecoder(codec: packet.formatHint)
+        try ensureDecoder(codec: packet.formatHint, codecConfig: packet.codecConfig)
         guard let decoderHandle = handleBox.raw else {
             throw VideoDecodeError.backendUnavailable
         }
 
         let bytestream = BitstreamConverter.toAnnexBIfNeeded(packet.data, codec: packet.formatHint)
+        let packetSideDataType = packet.sideDataType ?? 0
 
         var rawFrame = svp_ffmpeg_decoded_frame_t()
-        let status = bytestream.withUnsafeBytes { bytes in
-            svp_ffmpeg_video_decoder_decode(
-                decoderHandle,
-                bytes.bindMemory(to: UInt8.self).baseAddress,
-                Int32(bytestream.count),
-                pts,
-                &rawFrame
-            )
+        let status: Int32
+        if let sideData = packet.sideData, !sideData.isEmpty {
+            status = bytestream.withUnsafeBytes { bytes in
+                sideData.withUnsafeBytes { sideBytes in
+                    svp_ffmpeg_video_decoder_decode(
+                        decoderHandle,
+                        bytes.bindMemory(to: UInt8.self).baseAddress,
+                        Int32(bytestream.count),
+                        pts,
+                        packetSideDataType,
+                        sideBytes.bindMemory(to: UInt8.self).baseAddress,
+                        Int32(sideData.count),
+                        &rawFrame
+                    )
+                }
+            }
+        } else {
+            status = bytestream.withUnsafeBytes { bytes in
+                svp_ffmpeg_video_decoder_decode(
+                    decoderHandle,
+                    bytes.bindMemory(to: UInt8.self).baseAddress,
+                    Int32(bytestream.count),
+                    pts,
+                    0,
+                    nil,
+                    0,
+                    &rawFrame
+                )
+            }
         }
         defer { svp_ffmpeg_decoded_frame_release(&rawFrame) }
 
@@ -47,6 +70,9 @@ public actor FFmpegVideoDecoder: VideoDecoder {
             return nil
         }
         if status < 0 {
+            if shouldRecreateDecoder(for: status) {
+                resetDecoderHandle()
+            }
             throw VideoDecodeError.decodeFailed(OSStatus(status))
         }
 
@@ -60,18 +86,49 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         _ = svp_ffmpeg_video_decoder_flush(decoderHandle)
     }
 
-    private func ensureDecoder(codec: CodecID) throws {
-        if activeCodec != codec {
+    private func resetDecoderHandle() {
+        if let decoderHandle = handleBox.raw {
+            svp_ffmpeg_video_decoder_destroy(decoderHandle)
+            handleBox.raw = nil
+        }
+    }
+
+    private func shouldRecreateDecoder(for status: Int32) -> Bool {
+        // AVERROR_INVALIDDATA and AVERROR(EINVAL)-style failures can leave codec
+        // state unusable for subsequent packets in long-running network streams.
+        if status == -1094995529 { // AVERROR_INVALIDDATA
+            return true
+        }
+        if status == -22 { // AVERROR(EINVAL)
+            return true
+        }
+        return false
+    }
+
+    private func ensureDecoder(codec: CodecID, codecConfig: Data?) throws {
+        if activeCodec != codec || activeCodecConfig != codecConfig {
             if let decoderHandle = handleBox.raw {
                 svp_ffmpeg_video_decoder_destroy(decoderHandle)
                 handleBox.raw = nil
             }
             self.activeCodec = codec
+            self.activeCodecConfig = codecConfig
         }
         if handleBox.raw != nil {
             return
         }
-        let created = svp_ffmpeg_video_decoder_create(codecID(codec))
+        let created: UnsafeMutableRawPointer?
+        if let codecConfig, !codecConfig.isEmpty {
+            created = codecConfig.withUnsafeBytes { bytes in
+                svp_ffmpeg_video_decoder_create_with_extradata(
+                    codecID(codec),
+                    bytes.bindMemory(to: UInt8.self).baseAddress,
+                    Int32(codecConfig.count)
+                )
+            }
+        } else {
+            created = svp_ffmpeg_video_decoder_create(codecID(codec))
+        }
         guard let created else {
             throw VideoDecodeError.backendUnavailable
         }

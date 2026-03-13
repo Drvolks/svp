@@ -82,6 +82,8 @@ public struct DemuxedPacket: Sendable {
     public let duration: Int64?
     public let data: Data
     public let codecConfig: Data?
+    public let sideData: Data?
+    public let sideDataType: Int32?
     public let isKeyframe: Bool
     public let formatHint: CodecID
 
@@ -92,6 +94,8 @@ public struct DemuxedPacket: Sendable {
         duration: Int64?,
         data: Data,
         codecConfig: Data? = nil,
+        sideData: Data? = nil,
+        sideDataType: Int32? = nil,
         isKeyframe: Bool,
         formatHint: CodecID
     ) {
@@ -101,6 +105,8 @@ public struct DemuxedPacket: Sendable {
         self.duration = duration
         self.data = data
         self.codecConfig = codecConfig
+        self.sideData = sideData
+        self.sideDataType = sideDataType
         self.isKeyframe = isKeyframe
         self.formatHint = formatHint
     }

@@ -60,6 +60,8 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         duration: packet.duration,
                         data: packet.data,
                         codecConfig: packet.codecConfig,
+                        sideData: packet.sideData,
+                        sideDataType: packet.sideDataType,
                         isKeyframe: packet.isKeyframe,
                         formatHint: packet.formatHint
                     )

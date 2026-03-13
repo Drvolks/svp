@@ -17,7 +17,7 @@ extension FFmpegDemuxError: PlaybackCategorizedError {
 }
 
 public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
-    private static let buildStamp = "SVP_LOCAL_2026-03-12T16:11"
+    private static let buildStamp = "SVP_LOCAL_2026-03-13T01:05"
     private let url: URL
     private let handleBox = FFmpegDemuxerHandleBox()
     private var streamInfoByIndex: [Int32: svp_ffmpeg_stream_info_t] = [:]
@@ -147,6 +147,10 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         guard rawPacket.size > 0, let dataPtr = rawPacket.data else { return nil }
 
         let data = Data(bytes: dataPtr, count: Int(rawPacket.size))
+        let packetSideData: Data? = {
+            guard rawPacket.sideDataSize > 0, let sideDataPtr = rawPacket.sideData else { return nil }
+            return Data(bytes: sideDataPtr, count: Int(rawPacket.sideDataSize))
+        }()
         let info = streamInfoByIndex[rawPacket.streamIndex]
         let timebaseNum = Int64(info?.timebaseNum ?? 1)
         let timebaseDen = Int64(info?.timebaseDen ?? 90_000)
@@ -166,6 +170,8 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             duration: rawPacket.hasDuration == 1 ? scaleTo90k(rawPacket.duration, num: timebaseNum, den: timebaseDen) : nil,
             data: data,
             codecConfig: streamCodecConfigByIndex[rawPacket.streamIndex],
+            sideData: packetSideData,
+            sideDataType: rawPacket.sideDataType > 0 ? rawPacket.sideDataType : nil,
             isKeyframe: rawPacket.isKeyframe == 1,
             formatHint: codec
         )

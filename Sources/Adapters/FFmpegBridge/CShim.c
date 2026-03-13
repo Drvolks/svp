@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <pthread.h>
 #if __has_include(<TargetConditionals.h>)
 #include <TargetConditionals.h>
 #endif
@@ -45,7 +47,16 @@ struct svp_ffmpeg_audio_decoder {
     uint8_t *pending_packet_data;
     int32_t pending_packet_length;
     int64_t pending_packet_pts90k;
+    int64_t last_sent_packet_pts90k;
 };
+
+/*
+ * FFmpegKit on Apple simulator has shown instability when multiple demuxers
+ * read concurrently (split audio/video feeds). Serialize sensitive demux calls.
+ */
+static pthread_mutex_t g_ffmpeg_demux_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_svp_bridge_stamp_printed = 0;
+static int g_svp_demux_invalid_packet_drops = 0;
 #endif
 
 static int32_t map_ffmpeg_codec_to_bridge(int codecID) {
@@ -185,103 +196,28 @@ static void free_demuxer(struct svp_ffmpeg_demuxer *demuxer) {
 }
 
 static int init_bitstream_filters(struct svp_ffmpeg_demuxer *demuxer) {
-    int32_t streamCount;
-    int32_t i;
-    const char *enableBSF;
-
-    if (demuxer == NULL || demuxer->format_ctx == NULL) {
-        return -1;
-    }
-
+    (void)demuxer;
     /*
-     * Some real-world streams can trigger hard asserts inside FFmpeg's
-     * codec bitstream (CBS) helpers used by mp4toannexb filters.
-     * Keep BSF disabled by default for app stability, and allow opt-in
-     * via environment variable when debugging specific streams.
+     * IMPORTANT:
+     * AV1 BSF `av1_frame_merge` is intentionally disabled for this runtime.
+     *
+     * Why:
+     * - On YouTube AV1 MP4 streams in our current FFmpegKit baseline, the BSF
+     *   frequently reports "No sequence header available" and can hit an
+     *   internal libavcodec/cbs assertion (process abort).
+     * - This is an unrecoverable failure mode from inside FFmpeg.
+     *
+     * Consequence:
+     * - Keep packets in original demuxed form and handle resiliency at decode/
+     *   playback level instead of risking BSF-triggered aborts.
      */
-    enableBSF = getenv("SVP_ENABLE_BSF");
-    if (enableBSF == NULL || strcmp(enableBSF, "1") != 0) {
-        return 0;
-    }
-
-    streamCount = (int32_t)demuxer->format_ctx->nb_streams;
-    if (streamCount <= 0) {
-        return 0;
-    }
-
-    demuxer->bsf_by_stream = (AVBSFContext **)calloc((size_t)streamCount, sizeof(AVBSFContext *));
-    if (demuxer->bsf_by_stream == NULL) {
-        return -2;
-    }
-    demuxer->bsf_count = streamCount;
-
-    for (i = 0; i < streamCount; i++) {
-        AVStream *stream = demuxer->format_ctx->streams[i];
-        AVCodecParameters *codecPar = stream->codecpar;
-        const char *filterName = NULL;
-        const AVBitStreamFilter *filter = NULL;
-        AVBSFContext *bsf = NULL;
-
-        if (codecPar == NULL || codecPar->codec_type != AVMEDIA_TYPE_VIDEO) {
-            continue;
-        }
-        if (codecPar->codec_id == AV_CODEC_ID_H264) {
-            filterName = "h264_mp4toannexb";
-        } else if (codecPar->codec_id == AV_CODEC_ID_HEVC) {
-            filterName = "hevc_mp4toannexb";
-        } else {
-            continue;
-        }
-
-        filter = av_bsf_get_by_name(filterName);
-        if (filter == NULL) {
-            continue;
-        }
-        if (av_bsf_alloc(filter, &bsf) < 0 || bsf == NULL) {
-            continue;
-        }
-        if (avcodec_parameters_copy(bsf->par_in, codecPar) < 0) {
-            av_bsf_free(&bsf);
-            continue;
-        }
-        bsf->time_base_in = stream->time_base;
-        if (av_bsf_init(bsf) < 0) {
-            av_bsf_free(&bsf);
-            continue;
-        }
-        demuxer->bsf_by_stream[i] = bsf;
-    }
-
     return 0;
 }
 
 static int filter_packet_if_needed(struct svp_ffmpeg_demuxer *demuxer, AVPacket *packet) {
-    AVBSFContext *bsf;
-    int ret;
-
-    if (demuxer == NULL || packet == NULL) {
-        return -1;
-    }
-    if (demuxer->bsf_by_stream == NULL || packet->stream_index < 0 || packet->stream_index >= demuxer->bsf_count) {
-        return 0;
-    }
-
-    bsf = demuxer->bsf_by_stream[packet->stream_index];
-    if (bsf == NULL) {
-        return 0;
-    }
-
-    ret = av_bsf_send_packet(bsf, packet);
-    if (ret < 0) {
-        return ret;
-    }
-
-    av_packet_unref(packet);
-    ret = av_bsf_receive_packet(bsf, packet);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        return 0;
-    }
-    return ret;
+    (void)demuxer;
+    (void)packet;
+    return 0;
 }
 #endif
 
@@ -295,33 +231,34 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
         return NULL;
     }
 
+    if (!g_svp_bridge_stamp_printed) {
+        g_svp_bridge_stamp_printed = 1;
+        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T01:05\n");
+    }
+
     avformat_network_init();
 
     /*
-     * Defensive network/demux options for unstable CDN responses:
-     * avoid exploding on minor corruption and prefer reconnect behavior.
+     * Keep demux strict for signed media URLs.
+     * ignore_err/discardcorrupt can leak malformed packets to decoders and
+     * trigger sustained invalid-data failures (notably AV1/dav1d).
      */
-    av_dict_set(&options, "fflags", "+discardcorrupt", 0);
-    av_dict_set(&options, "err_detect", "ignore_err", 0);
-    av_dict_set(&options, "reconnect", "1", 0);
-    av_dict_set(&options, "reconnect_streamed", "1", 0);
-    av_dict_set(&options, "reconnect_on_network_error", "1", 0);
     av_dict_set(&options, "user_agent", "Tube2-SVP/1.0", 0);
 
+    pthread_mutex_lock(&g_ffmpeg_demux_mutex);
     if (avformat_open_input(&formatCtx, url, NULL, &options) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
         av_dict_free(&options);
         return NULL;
     }
     av_dict_free(&options);
 
-    if (formatCtx != NULL) {
-        formatCtx->flags |= AVFMT_FLAG_DISCARD_CORRUPT;
-        formatCtx->error_recognition = AV_EF_IGNORE_ERR;
-    }
     if (avformat_find_stream_info(formatCtx, NULL) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
         avformat_close_input(&formatCtx);
         return NULL;
     }
+    pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
 
     demuxer = (struct svp_ffmpeg_demuxer *)calloc(1, sizeof(struct svp_ffmpeg_demuxer));
     if (demuxer == NULL) {
@@ -458,10 +395,15 @@ int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_p
     }
 
     while (1) {
+        pthread_mutex_lock(&g_ffmpeg_demux_mutex);
         readStatus = av_read_frame(demuxer->format_ctx, packet);
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
         if (readStatus == AVERROR_EOF) {
             av_packet_free(&packet);
             return 0;
+        }
+        if (readStatus == AVERROR_INVALIDDATA) {
+            continue;
         }
         if (readStatus < 0) {
             av_packet_free(&packet);
@@ -469,6 +411,14 @@ int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_p
         }
 
         readStatus = filter_packet_if_needed(demuxer, packet);
+        if (readStatus == AVERROR_INVALIDDATA) {
+            g_svp_demux_invalid_packet_drops += 1;
+            if (g_svp_demux_invalid_packet_drops == 1 || g_svp_demux_invalid_packet_drops % 25 == 0) {
+                fprintf(stderr, "[SVP][Demux] drop_invalid_packet count=%d\n", g_svp_demux_invalid_packet_drops);
+            }
+            av_packet_unref(packet);
+            continue;
+        }
         if (readStatus < 0) {
             av_packet_free(&packet);
             return readStatus;
@@ -492,6 +442,9 @@ int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_p
     outPacket->dts = packet->dts;
     outPacket->duration = packet->duration;
     outPacket->size = packet->size;
+    outPacket->sideDataType = 0;
+    outPacket->sideData = NULL;
+    outPacket->sideDataSize = 0;
 
     if (packet->size > 0) {
         outPacket->data = (uint8_t *)malloc((size_t)packet->size);
@@ -500,6 +453,31 @@ int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_p
             return -3;
         }
         memcpy(outPacket->data, packet->data, (size_t)packet->size);
+    }
+
+    if (packet->side_data_elems > 0 && packet->side_data != NULL) {
+        int i;
+        const AVPacketSideData *picked = NULL;
+
+        for (i = 0; i < packet->side_data_elems; i++) {
+            const AVPacketSideData *candidate = &packet->side_data[i];
+            if (candidate->data == NULL || candidate->size <= 0) {
+                continue;
+            }
+            if (candidate->type == AV_PKT_DATA_NEW_EXTRADATA) {
+                picked = candidate;
+                break;
+            }
+        }
+
+        if (picked != NULL && picked->size > 0) {
+            outPacket->sideData = (uint8_t *)malloc((size_t)picked->size);
+            if (outPacket->sideData != NULL) {
+                memcpy(outPacket->sideData, picked->data, (size_t)picked->size);
+                outPacket->sideDataSize = (int32_t)picked->size;
+                outPacket->sideDataType = (int32_t)picked->type;
+            }
+        }
     }
 
     av_packet_free(&packet);
@@ -564,7 +542,13 @@ void svp_ffmpeg_demuxed_packet_release(svp_ffmpeg_demuxed_packet_t *packet) {
         free(packet->data);
         packet->data = NULL;
     }
+    if (packet->sideData != NULL) {
+        free(packet->sideData);
+        packet->sideData = NULL;
+    }
     packet->size = 0;
+    packet->sideDataSize = 0;
+    packet->sideDataType = 0;
 }
 
 #if SVP_HAS_VENDOR_FFMPEG
@@ -586,7 +570,7 @@ static void free_decoder(struct svp_ffmpeg_video_decoder *decoder) {
 }
 #endif
 
-void *svp_ffmpeg_video_decoder_create(int32_t codecID) {
+void *svp_ffmpeg_video_decoder_create_with_extradata(int32_t codecID, const uint8_t *data, int32_t length) {
 #if SVP_HAS_VENDOR_FFMPEG
     const int ffCodecID = map_codec_id(codecID);
     const AVCodec *codec;
@@ -610,6 +594,15 @@ void *svp_ffmpeg_video_decoder_create(int32_t codecID) {
         free_decoder(decoder);
         return NULL;
     }
+    if (data != NULL && length > 0) {
+        decoder->codec_ctx->extradata = (uint8_t *)av_mallocz((size_t)length + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (decoder->codec_ctx->extradata == NULL) {
+            free_decoder(decoder);
+            return NULL;
+        }
+        memcpy(decoder->codec_ctx->extradata, data, (size_t)length);
+        decoder->codec_ctx->extradata_size = length;
+    }
     decoder->codec_ctx->thread_count = 0;
     decoder->codec_ctx->thread_type = FF_THREAD_FRAME;
 
@@ -627,8 +620,14 @@ void *svp_ffmpeg_video_decoder_create(int32_t codecID) {
     return decoder;
 #else
     (void)codecID;
+    (void)data;
+    (void)length;
     return NULL;
 #endif
+}
+
+void *svp_ffmpeg_video_decoder_create(int32_t codecID) {
+    return svp_ffmpeg_video_decoder_create_with_extradata(codecID, NULL, 0);
 }
 
 void svp_ffmpeg_video_decoder_destroy(void *decoderHandle) {
@@ -811,10 +810,11 @@ static int32_t fill_decoded_audio_frame(
         return -9;
     }
     memcpy(outFrame->data, outData, (size_t)outFrame->size);
-    outFrame->pts90k = 0;
-    if (decoder->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-        outFrame->pts90k = decoder->frame->best_effort_timestamp;
-    }
+    /*
+     * Keep SVP timeline in 90k. FFmpeg best_effort_timestamp is decoder-timebase
+     * dependent and can break A/V sync if interpreted as 90k.
+     */
+    outFrame->pts90k = decoder->last_sent_packet_pts90k;
 
     av_freep(&outData);
     av_frame_unref(decoder->frame);
@@ -845,6 +845,7 @@ static int32_t send_audio_packet(
     memcpy(packet->data, data, (size_t)length);
     packet->pts = pts90k;
     packet->dts = pts90k;
+    decoder->last_sent_packet_pts90k = pts90k;
 
     sendStatus = avcodec_send_packet(decoder->codec_ctx, packet);
     av_packet_free(&packet);
@@ -1096,6 +1097,9 @@ int32_t svp_ffmpeg_video_decoder_decode(
     const uint8_t *data,
     int32_t length,
     int64_t pts90k,
+    int32_t sideDataType,
+    const uint8_t *sideData,
+    int32_t sideDataSize,
     svp_ffmpeg_decoded_frame_t *outFrame
 ) {
 #if SVP_HAS_VENDOR_FFMPEG
@@ -1103,6 +1107,7 @@ int32_t svp_ffmpeg_video_decoder_decode(
     AVPacket *packet;
     int sendStatus;
     int receiveStatus;
+    int haveDrainedFrame = 0;
     int dstLinesize[4] = {0};
     uint8_t *dstData[4] = {0};
     int convertedHeight;
@@ -1130,14 +1135,43 @@ int32_t svp_ffmpeg_video_decoder_decode(
     memcpy(packet->data, data, (size_t)length);
     packet->pts = pts90k;
     packet->dts = pts90k;
+    (void)sideDataType;
+    (void)sideData;
+    (void)sideDataSize;
 
-    sendStatus = avcodec_send_packet(decoder->codec_ctx, packet);
-    av_packet_free(&packet);
-    if (sendStatus < 0) {
-        return sendStatus;
+    while (1) {
+        sendStatus = avcodec_send_packet(decoder->codec_ctx, packet);
+        if (sendStatus == 0) {
+            break;
+        }
+        if (sendStatus != AVERROR(EAGAIN)) {
+            av_packet_free(&packet);
+            return sendStatus;
+        }
+
+        /*
+         * Output queue full: drain one frame, then retry sending the same packet.
+         * This avoids dropping packets under backpressure.
+         */
+        receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+        if (receiveStatus >= 0) {
+            haveDrainedFrame = 1;
+            continue;
+        }
+        if (receiveStatus == AVERROR(EAGAIN) || receiveStatus == AVERROR_EOF) {
+            av_packet_free(&packet);
+            return 0;
+        }
+        av_packet_free(&packet);
+        return receiveStatus;
     }
+    av_packet_free(&packet);
 
-    receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+    if (!haveDrainedFrame) {
+        receiveStatus = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+    } else {
+        receiveStatus = 0;
+    }
     if (receiveStatus == AVERROR(EAGAIN) || receiveStatus == AVERROR_EOF) {
         return 0;
     }
@@ -1204,10 +1238,10 @@ int32_t svp_ffmpeg_video_decoder_decode(
     outFrame->height = decoder->frame->height;
     outFrame->linesizeY = dstLinesize[0];
     outFrame->linesizeUV = dstLinesize[1];
+    /*
+     * Keep packet PTS in 90k domain; do not remap with decoder-local timestamps.
+     */
     outFrame->pts90k = pts90k;
-    if (decoder->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-        outFrame->pts90k = decoder->frame->best_effort_timestamp;
-    }
 
     av_freep(&dstData[0]);
     av_frame_unref(decoder->frame);
@@ -1217,6 +1251,9 @@ int32_t svp_ffmpeg_video_decoder_decode(
     (void)data;
     (void)length;
     (void)pts90k;
+    (void)sideDataType;
+    (void)sideData;
+    (void)sideDataSize;
     (void)outFrame;
     return -38;
 #endif
