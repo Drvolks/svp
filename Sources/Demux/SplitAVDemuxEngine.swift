@@ -8,6 +8,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
     private let audioDemuxer: any DemuxEngine
     private let videoStreamIDOffset = 1_000
     private let audioStreamIDOffset = 2_000
+    private var mergeGeneration: UInt64 = 0
 
     public init(videoDemuxer: any DemuxEngine, audioDemuxer: any DemuxEngine) {
         self.videoDemuxer = videoDemuxer
@@ -15,10 +16,18 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
     }
 
     public func makePacketStream() -> AsyncThrowingStream<DemuxedPacket, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
+        mergeGeneration &+= 1
+        let generation = mergeGeneration
+        return AsyncThrowingStream { continuation in
+            let task = Task { [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
                 var firstVideoPTS: Int64?
                 var firstAudioPTS: Int64?
+                var lastVideoNormalizedPTS: Int64?
+                var lastAudioNormalizedPTS: Int64?
                 var forwardedVideoPackets = 0
                 var forwardedAudioPackets = 0
 
@@ -67,6 +76,52 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     )
                 }
 
+                func normalizeWithFallback(
+                    _ packet: DemuxedPacket,
+                    firstPTS: inout Int64?,
+                    lastPTS: inout Int64?,
+                    streamIDOffset: Int,
+                    defaultStep90k: Int64
+                ) -> DemuxedPacket {
+                    let normalized = normalize(packet, firstPTS: &firstPTS, streamIDOffset: streamIDOffset)
+                    var pts = normalized.pts
+                    var dts = normalized.dts
+
+                    if pts == nil && dts == nil {
+                        let step = max(1, normalized.duration ?? defaultStep90k)
+                        if let lastPTS {
+                            pts = lastPTS + step
+                            dts = pts
+                        } else {
+                            pts = 0
+                            dts = 0
+                        }
+                    } else if pts == nil {
+                        pts = dts
+                    } else if dts == nil {
+                        dts = pts
+                    }
+
+                    if let pts {
+                        lastPTS = pts
+                    } else if let dts {
+                        lastPTS = dts
+                    }
+
+                    return DemuxedPacket(
+                        streamID: normalized.streamID,
+                        pts: pts,
+                        dts: dts,
+                        duration: normalized.duration,
+                        data: normalized.data,
+                        codecConfig: normalized.codecConfig,
+                        sideData: normalized.sideData,
+                        sideDataType: normalized.sideDataType,
+                        isKeyframe: normalized.isKeyframe,
+                        formatHint: normalized.formatHint
+                    )
+                }
+
                 func packetTimestamp(_ packet: DemuxedPacket) -> Int64 {
                     packet.pts ?? packet.dts ?? .max
                 }
@@ -74,36 +129,66 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                 func nextFilteredVideo(
                     _ iterator: inout AsyncThrowingStream<DemuxedPacket, Error>.AsyncIterator
                 ) async throws -> DemuxedPacket? {
-                    while let packet = try await iterator.next() {
+                    while true {
+                        guard await self.isMergeGenerationCurrent(generation) else {
+                            return nil
+                        }
+                        guard let packet = try await iterator.next() else {
+                            if await self.isMergeGenerationCurrent(generation) {
+                                log("video_eof forwarded=\(forwardedVideoPackets)")
+                            }
+                            return nil
+                        }
                         guard isVideoPacket(packet) else { continue }
-                        let normalized = normalize(packet, firstPTS: &firstVideoPTS, streamIDOffset: videoStreamIDOffset)
+                        let normalized = normalizeWithFallback(
+                            packet,
+                            firstPTS: &firstVideoPTS,
+                            lastPTS: &lastVideoNormalizedPTS,
+                            streamIDOffset: videoStreamIDOffset,
+                            defaultStep90k: 3_003
+                        )
                         forwardedVideoPackets += 1
                         if forwardedVideoPackets == 1 || forwardedVideoPackets % 300 == 0 {
                             log("video_forward count=\(forwardedVideoPackets) pts=\(String(describing: normalized.pts))")
                         }
                         return normalized
                     }
-                    log("video_eof forwarded=\(forwardedVideoPackets)")
-                    return nil
                 }
 
                 func nextFilteredAudio(
                     _ iterator: inout AsyncThrowingStream<DemuxedPacket, Error>.AsyncIterator
                 ) async throws -> DemuxedPacket? {
-                    while let packet = try await iterator.next() {
+                    while true {
+                        guard await self.isMergeGenerationCurrent(generation) else {
+                            return nil
+                        }
+                        guard let packet = try await iterator.next() else {
+                            if await self.isMergeGenerationCurrent(generation) {
+                                log("audio_eof forwarded=\(forwardedAudioPackets)")
+                            }
+                            return nil
+                        }
                         guard isAudioPacket(packet) else { continue }
-                        let normalized = normalize(packet, firstPTS: &firstAudioPTS, streamIDOffset: audioStreamIDOffset)
+                        let normalized = normalizeWithFallback(
+                            packet,
+                            firstPTS: &firstAudioPTS,
+                            lastPTS: &lastAudioNormalizedPTS,
+                            streamIDOffset: audioStreamIDOffset,
+                            defaultStep90k: 2_088
+                        )
                         forwardedAudioPackets += 1
                         if forwardedAudioPackets == 1 || forwardedAudioPackets % 300 == 0 {
                             log("audio_forward count=\(forwardedAudioPackets) pts=\(String(describing: normalized.pts))")
                         }
                         return normalized
                     }
-                    log("audio_eof forwarded=\(forwardedAudioPackets)")
-                    return nil
                 }
 
                 do {
+                    guard await self.isMergeGenerationCurrent(generation) else {
+                        continuation.finish()
+                        return
+                    }
                     let videoStream = await videoDemuxer.makePacketStream()
                     let audioStream = await audioDemuxer.makePacketStream()
                     var videoIterator = videoStream.makeAsyncIterator()
@@ -112,6 +197,10 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     var nextAudio = try await nextFilteredAudio(&audioIterator)
 
                     while !Task.isCancelled {
+                        guard await self.isMergeGenerationCurrent(generation) else {
+                            continuation.finish()
+                            return
+                        }
                         switch (nextVideo, nextAudio) {
                         case let (video?, audio?):
                             if packetTimestamp(video) <= packetTimestamp(audio) {
@@ -134,8 +223,12 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     }
                     continuation.finish()
                 } catch {
-                    log("merge_error \(error)")
-                    continuation.finish(throwing: error)
+                    if await self.isMergeGenerationCurrent(generation) {
+                        log("merge_error \(error)")
+                        continuation.finish(throwing: error)
+                    } else {
+                        continuation.finish()
+                    }
                 }
             }
 
@@ -143,6 +236,10 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                 task.cancel()
             }
         }
+    }
+
+    private func isMergeGenerationCurrent(_ generation: UInt64) -> Bool {
+        generation == mergeGeneration
     }
 
     public func seek(to: CMTime) async throws {

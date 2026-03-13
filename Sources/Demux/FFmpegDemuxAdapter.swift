@@ -17,19 +17,22 @@ extension FFmpegDemuxError: PlaybackCategorizedError {
 }
 
 public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
-    private static let buildStamp = "SVP_LOCAL_2026-03-13T01:05"
+    private static let buildStamp = "SVP_LOCAL_2026-03-13T13:30"
     private let url: URL
     private let handleBox = FFmpegDemuxerHandleBox()
     private var streamInfoByIndex: [Int32: svp_ffmpeg_stream_info_t] = [:]
     private var streamCodecConfigByIndex: [Int32: Data] = [:]
     private var loggedFirstPacket = false
+    private var packetStreamGeneration: UInt64 = 0
 
     public init(url: URL) {
         self.url = url
     }
 
     public func makePacketStream() -> AsyncThrowingStream<DemuxedPacket, Error> {
-        AsyncThrowingStream { continuation in
+        packetStreamGeneration &+= 1
+        let generation = packetStreamGeneration
+        return AsyncThrowingStream { continuation in
             let task = Task { [weak self] in
                 guard let self else {
                     continuation.finish()
@@ -37,8 +40,16 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                 }
                 do {
                     try await self.openIfNeeded()
+                    guard await self.isPacketStreamGenerationCurrent(generation) else {
+                        continuation.finish()
+                        return
+                    }
                     await self.log("packet_stream_started")
                     while !Task.isCancelled {
+                        guard await self.isPacketStreamGenerationCurrent(generation) else {
+                            continuation.finish()
+                            return
+                        }
                         guard let handle = self.handleBox.raw else {
                             throw FFmpegDemuxError.openFailed(reason: "demux handle is nil after open")
                         }
@@ -54,6 +65,10 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                             throw FFmpegDemuxError.readFailed(status)
                         }
                         if let packet = await self.makePacket(from: rawPacket) {
+                            guard await self.isPacketStreamGenerationCurrent(generation) else {
+                                continuation.finish()
+                                return
+                            }
                             await self.logFirstPacketIfNeeded(packet)
                             continuation.yield(packet)
                         }
@@ -201,6 +216,10 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             return url.path
         }
         return url.absoluteString
+    }
+
+    private func isPacketStreamGenerationCurrent(_ generation: UInt64) -> Bool {
+        generation == packetStreamGeneration
     }
 
     private func logFirstPacketIfNeeded(_ packet: DemuxedPacket) {

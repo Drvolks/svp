@@ -8,6 +8,8 @@ public actor FFmpegVideoDecoder: VideoDecoder {
     private let handleBox = FFmpegDecoderHandleBox()
     private var activeCodec: CodecID?
     private var activeCodecConfig: Data?
+    private var droppedInvalidPacketCount = 0
+    private var consecutiveInvalidPacketDrops = 0
 
     public init() {}
 
@@ -70,11 +72,31 @@ public actor FFmpegVideoDecoder: VideoDecoder {
             return nil
         }
         if status < 0 {
+            if shouldIgnoreDecodeError(status) {
+                droppedInvalidPacketCount += 1
+                consecutiveInvalidPacketDrops += 1
+                #if DEBUG
+                if droppedInvalidPacketCount == 1 || droppedInvalidPacketCount % 25 == 0 {
+                    print("[SVP][Decode] drop_invalid_packet codec=\(packet.formatHint) status=\(status) count=\(droppedInvalidPacketCount)")
+                }
+                #endif
+                if consecutiveInvalidPacketDrops >= 8 {
+                    // Persistent invalid packets usually indicate we started mid-GOP
+                    // or decoder state drifted. Escalate so PlaybackSession can
+                    // enter keyframe resync mode and flush stale decode state.
+                    consecutiveInvalidPacketDrops = 0
+                    throw VideoDecodeError.decodeFailed(OSStatus(status))
+                }
+                return nil
+            }
             if shouldRecreateDecoder(for: status) {
                 resetDecoderHandle()
             }
+            consecutiveInvalidPacketDrops = 0
             throw VideoDecodeError.decodeFailed(OSStatus(status))
         }
+
+        consecutiveInvalidPacketDrops = 0
 
         let pixelBuffer = try makePixelBuffer(from: rawFrame)
         let framePTS = CMTime(value: rawFrame.pts90k, timescale: 90_000)
@@ -94,15 +116,19 @@ public actor FFmpegVideoDecoder: VideoDecoder {
     }
 
     private func shouldRecreateDecoder(for status: Int32) -> Bool {
-        // AVERROR_INVALIDDATA and AVERROR(EINVAL)-style failures can leave codec
-        // state unusable for subsequent packets in long-running network streams.
-        if status == -1094995529 { // AVERROR_INVALIDDATA
-            return true
-        }
+        // INVALIDDATA is often recoverable with subsequent packets/keyframes.
+        // Recreating decoder state on every invalid packet causes visible
+        // playback stalls for network streams.
         if status == -22 { // AVERROR(EINVAL)
             return true
         }
         return false
+    }
+
+    private func shouldIgnoreDecodeError(_ status: Int32) -> Bool {
+        // AVERROR_INVALIDDATA (FFERRTAG('I','N','D','A')): treat as a dropped/corrupt packet.
+        // Escalating this to playback-level resync causes slideshow behavior on split VOD.
+        return status == -1094995529
     }
 
     private func ensureDecoder(codec: CodecID, codecConfig: Data?) throws {

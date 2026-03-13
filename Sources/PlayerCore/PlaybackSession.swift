@@ -43,6 +43,7 @@ public actor PlaybackSession: PlayerEngine {
     private let videoFrameStallLowWaterSeconds: Double = 0.20
     private let videoPacketStallLowWaterSeconds: Double = 0.20
     private var eventContinuations: [UUID: AsyncStream<PlaybackEvent>.Continuation] = [:]
+    private var taskGeneration: UInt64 = 0
     private var knownDuration: CMTime?
     private var sourceDescriptor: MediaSourceDescriptor?
     private var packetCount: Int = 0
@@ -75,6 +76,8 @@ public actor PlaybackSession: PlayerEngine {
     private let liveFrameBacklogSoftLimitSeconds: Double = 0.35
     private let liveVideoDecodeLeadSoftLimitSeconds: Double = 0.18
     private let splitAudioPacketBacklogSoftLimitSeconds: Double = 0.35
+    private let liveAudioDecodeLeadSoftLimitSeconds: Double = 0.20
+    private let vodAudioDecodeLeadSoftLimitSeconds: Double = 0.65
 
     public init(
         clock: MediaClock = MediaClock(),
@@ -132,14 +135,16 @@ public actor PlaybackSession: PlayerEngine {
         for output in audioOutputs.values {
             (output as? any AudioOutputLifecycle)?.handlePlay()
         }
-        await startWorkerTasksIfNeeded()
+        taskGeneration &+= 1
+        let generation = taskGeneration
+        await startWorkerTasksIfNeeded(generation: generation)
         watchdogTask = Task { [weak self] in
             guard let self else { return }
-            await self.monitorForStalls()
+            await self.monitorForStalls(generation: generation)
         }
         demuxTask = Task { [weak self] in
             guard let self else { return }
-            await self.runDemuxLoop()
+            await self.runDemuxLoop(generation: generation)
         }
     }
 
@@ -237,12 +242,13 @@ public actor PlaybackSession: PlayerEngine {
         diagnostics.snapshot()
     }
 
-    private func runDemuxLoop() async {
+    private func runDemuxLoop(generation: UInt64) async {
+        guard isGenerationCurrent(generation) else { return }
         do {
             diagnostics.log("packet_consumer_started")
             let stream = await demuxer.makePacketStream()
             for try await packet in stream {
-                if Task.isCancelled { break }
+                if Task.isCancelled || !isGenerationCurrent(generation) { break }
                 try? await throttleLiveIngestionIfNeeded()
                 packetCount += 1
                 if packetCount == 1 || packetCount % 100 == 0 {
@@ -274,6 +280,7 @@ public actor PlaybackSession: PlayerEngine {
             if Task.isCancelled {
                 return
             }
+            guard isGenerationCurrent(generation) else { return }
             diagnostics.log("packet_stream_ended")
             demuxCompleted = true
             await logQueueHealth(context: "packet_stream_ended")
@@ -281,6 +288,7 @@ public actor PlaybackSession: PlayerEngine {
             await videoPacketQueue.close()
             await maybeFinishPlaybackAfterDrain()
         } catch {
+            guard isGenerationCurrent(generation) else { return }
             let playerError = makePlayerError(from: error)
             let description = describe(playerError)
             diagnostics.incrementDecodeFailure()
@@ -292,8 +300,8 @@ public actor PlaybackSession: PlayerEngine {
         }
     }
 
-    private func monitorForStalls() async {
-        while !Task.isCancelled {
+    private func monitorForStalls(generation: UInt64) async {
+        while !Task.isCancelled && isGenerationCurrent(generation) {
             let now = ProcessInfo.processInfo.systemUptime
             let sourceTimedOut = !demuxCompleted && (now - lastPacketUptime > rebufferThreshold)
             let buffersDrained = await arePlaybackBuffersDepletedForStall()
@@ -484,6 +492,7 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func stopPlaybackTasks() async {
+        taskGeneration &+= 1
         demuxTask?.cancel()
         demuxTask = nil
         audioTask?.cancel()
@@ -567,7 +576,7 @@ public actor PlaybackSession: PlayerEngine {
         )
     }
 
-    private func startWorkerTasksIfNeeded() async {
+    private func startWorkerTasksIfNeeded(generation: UInt64) async {
         guard audioTask == nil, videoDecodeTask == nil, videoPresentTask == nil else { return }
         demuxCompleted = false
         audioWorkerFinished = false
@@ -579,11 +588,11 @@ public actor PlaybackSession: PlayerEngine {
         await videoFrameQueue.reset()
         audioTask = Task { [weak self] in
             guard let self else { return }
-            await self.consumeAudioPackets()
+            await self.consumeAudioPackets(generation: generation)
         }
         videoDecodeTask = Task { [weak self] in
             guard let self else { return }
-            await self.decodeVideoPackets()
+            await self.decodeVideoPackets(generation: generation)
         }
         let preferredLeadSeconds: Double
         let useLivePresentation = sourceDescriptor?.isLive == true
@@ -620,25 +629,29 @@ public actor PlaybackSession: PlayerEngine {
                     )
                 }
             )
+            guard await self.isGenerationCurrent(generation) else { return }
             await self.finishVideoPresentWorker()
         }
     }
 
-    private func consumeAudioPackets() async {
+    private func consumeAudioPackets(generation: UInt64) async {
         while let packet = await audioPacketQueue.dequeue() {
-            if Task.isCancelled { return }
+            if Task.isCancelled || !isGenerationCurrent(generation) { return }
             do {
                 let frames = try await audioPipeline.decode(packet: packet)
                 guard !frames.isEmpty else { continue }
                 for frame in frames {
+                    if Task.isCancelled || !isGenerationCurrent(generation) { return }
+                    try? await throttleAudioDecodeIfNeeded(framePTS: frame.pts, generation: generation)
+                    if Task.isCancelled || !isGenerationCurrent(generation) { return }
                     if !loggedFirstAudioFrame {
                         loggedFirstAudioFrame = true
                         diagnostics.log("first_audio_frame pts=\(frame.pts.seconds)")
                     }
-                    syncAudioMasterClock(with: frame.pts)
                     for output in audioOutputs.values {
                         output.render(frame: frame)
                     }
+                    syncAudioMasterClock(with: frame.pts)
                 }
             } catch {
                 if Task.isCancelled { return }
@@ -647,16 +660,17 @@ public actor PlaybackSession: PlayerEngine {
                 diagnostics.log("audio_decode_drop error=\(description)")
             }
         }
+        guard isGenerationCurrent(generation) else { return }
         audioWorkerFinished = true
         await maybeFinishPlaybackAfterDrain()
     }
 
-    private func decodeVideoPackets() async {
+    private func decodeVideoPackets(generation: UInt64) async {
         while let packet = await videoPacketQueue.dequeue() {
-            if Task.isCancelled { return }
+            if Task.isCancelled || !isGenerationCurrent(generation) { return }
             if waitingForVideoKeyframeResync {
                 guard packet.isKeyframe else { continue }
-                if let audioPTS = lastAudioPTS, let keyPTS = packet.pts {
+                if let audioPTS = currentAudioClockForPresentation(allowDecodeFallback: false), let keyPTS = packet.pts {
                     let keyTime = CMTime(value: keyPTS, timescale: 90_000)
                     if (audioPTS - keyTime).seconds > 0.300 {
                         continue
@@ -707,9 +721,35 @@ public actor PlaybackSession: PlayerEngine {
                 lastRenderedVideoUptime = nil
             }
         }
+        guard isGenerationCurrent(generation) else { return }
         videoDecodeWorkerFinished = true
         await videoFrameQueue.close()
         await maybeFinishPlaybackAfterDrain()
+    }
+
+    private func isGenerationCurrent(_ generation: UInt64) -> Bool {
+        generation == taskGeneration
+    }
+
+    private func throttleAudioDecodeIfNeeded(framePTS: CMTime, generation: UInt64) async throws {
+        guard framePTS.isValid else { return }
+        let leadSoftLimit = sourceDescriptor?.isLive == true
+            ? liveAudioDecodeLeadSoftLimitSeconds
+            : vodAudioDecodeLeadSoftLimitSeconds
+
+        while !Task.isCancelled && isGenerationCurrent(generation) {
+            guard let playbackClock = currentAudioClockForPresentation(allowDecodeFallback: false),
+                  playbackClock.isValid else {
+                return
+            }
+            let leadSeconds = framePTS.seconds - playbackClock.seconds
+            let sleepSeconds = leadSeconds - leadSoftLimit
+            if sleepSeconds <= 0.01 {
+                return
+            }
+            let boundedSleep = min(0.02, sleepSeconds)
+            try await Task.sleep(nanoseconds: UInt64(boundedSleep * 1_000_000_000))
+        }
     }
 
     private func throttleLiveDecodedVideoIfNeeded(framePTS: CMTime) async throws {
@@ -752,7 +792,7 @@ public actor PlaybackSession: PlayerEngine {
         return lagSeconds > 0.300
     }
 
-    private func currentAudioClockForPresentation() -> CMTime? {
+    private func currentAudioClockForPresentation(allowDecodeFallback: Bool = true) -> CMTime? {
         var hasPlaybackClockProvider = false
         for output in audioOutputs.values {
             if let provider = output as? any AudioPlaybackClockProviding {
@@ -766,7 +806,10 @@ public actor PlaybackSession: PlayerEngine {
         if hasPlaybackClockProvider {
             return nil
         }
-        return lastAudioPTS
+        if allowDecodeFallback {
+            return lastAudioPTS
+        }
+        return nil
     }
 
     private func maybeFinishPlaybackAfterDrain() async {
@@ -820,18 +863,14 @@ public actor PlaybackSession: PlayerEngine {
         let audioBacklog = audio.mediaSpanSeconds.map { String(format: "%.3f", $0) } ?? "nil"
         let videoBacklog = video.mediaSpanSeconds.map { String(format: "%.3f", $0) } ?? "nil"
         let videoFrameBacklog = videoFrames.mediaSpanSeconds.map { String(format: "%.3f", $0) } ?? "nil"
-        let audioPTS: String
-        if let lastAudioPTS {
-            audioPTS = String(format: "%.3f", lastAudioPTS.seconds)
-        } else {
-            audioPTS = "nil"
-        }
+        let decodedAudioClock = lastAudioPTS.map { String(format: "%.3f", $0.seconds) } ?? "nil"
+        let playbackAudioClock = currentAudioClockForPresentation(allowDecodeFallback: false).map { String(format: "%.3f", $0.seconds) } ?? "nil"
         diagnostics.log(
             "queue_health context=\(context) " +
             "audio=count:\(audio.count)/\(audio.capacity),backlog:\(audioBacklog),firstPTS:\(String(describing: audio.firstPTS)),lastPTS:\(String(describing: audio.lastPTS)) " +
             "video=count:\(video.count)/\(video.capacity),backlog:\(videoBacklog),firstPTS:\(String(describing: video.firstPTS)),lastPTS:\(String(describing: video.lastPTS)) " +
             "videoFrames=count:\(videoFrames.count)/\(videoFrames.capacity),backlog:\(videoFrameBacklog),firstPTS:\(String(describing: videoFrames.firstPTSSeconds)),lastPTS:\(String(describing: videoFrames.lastPTSSeconds)) " +
-            "audioClock=\(audioPTS) waitingKeyframe=\(waitingForVideoKeyframeResync)"
+            "audioClockPlayback=\(playbackAudioClock) audioClockDecoded=\(decodedAudioClock) waitingKeyframe=\(waitingForVideoKeyframeResync)"
         )
     }
 

@@ -9,12 +9,14 @@ import Render
 public actor Player: PlayerEngine {
     private let session: PlaybackSession
     private let defaultAudioRenderer: AudioRenderer
+    private let sourceKindOverrideForLoad: SourceKind?
 
     public init(source: any InputSource, preferHardwareDecode: Bool = true) {
         let demux = Self.makeDemuxEngine(for: source)
         let video = DefaultVideoPipeline(preferHardware: preferHardwareDecode)
         let audio = DefaultAudioPipeline()
         self.defaultAudioRenderer = AudioRenderer()
+        self.sourceKindOverrideForLoad = nil
         self.session = PlaybackSession(demuxer: demux, videoPipeline: video, audioPipeline: audio)
         let session = self.session
         let defaultAudioRenderer = self.defaultAudioRenderer
@@ -24,11 +26,20 @@ public actor Player: PlayerEngine {
     }
 
     public init(videoSource: any InputSource, audioSource: any InputSource, preferHardwareDecode: Bool = true) {
-        let compositeSource = SplitAVInputSource(videoSource: videoSource, audioSource: audioSource)
-        let demux = Self.makeDemuxEngine(for: compositeSource)
+        let coalescedKind = Self.sameUnderlyingAsset(videoSource.descriptor.kind, audioSource.descriptor.kind)
+            ? videoSource.descriptor.kind
+            : nil
+        let demux: any DemuxEngine
+        if coalescedKind != nil {
+            demux = Self.makeDemuxEngine(for: videoSource)
+        } else {
+            let compositeSource = SplitAVInputSource(videoSource: videoSource, audioSource: audioSource)
+            demux = Self.makeDemuxEngine(for: compositeSource)
+        }
         let video = DefaultVideoPipeline(preferHardware: preferHardwareDecode)
         let audio = DefaultAudioPipeline()
         self.defaultAudioRenderer = AudioRenderer()
+        self.sourceKindOverrideForLoad = coalescedKind
         self.session = PlaybackSession(demuxer: demux, videoPipeline: video, audioPipeline: audio)
         let session = self.session
         let defaultAudioRenderer = self.defaultAudioRenderer
@@ -38,6 +49,19 @@ public actor Player: PlayerEngine {
     }
 
     public func load(_ source: PlayableSource) async throws {
+        if let kindOverride = sourceKindOverrideForLoad,
+           case .split = source.descriptor.kind {
+            let normalized = PlayableSource(
+                descriptor: MediaSourceDescriptor(
+                    kind: kindOverride,
+                    isLive: source.descriptor.isLive,
+                    streams: source.descriptor.streams,
+                    preferredClock: source.descriptor.preferredClock
+                )
+            )
+            try await session.load(normalized)
+            return
+        }
         try await session.load(source)
     }
 
@@ -114,5 +138,22 @@ public actor Player: PlayerEngine {
     private static func isTransportStreamURL(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ext == "ts" || ext == "m2ts"
+    }
+
+    private static func sameUnderlyingAsset(_ lhs: SourceKind, _ rhs: SourceKind) -> Bool {
+        switch (lhs, rhs) {
+        case let (.file(l), .file(r)):
+            return l == r
+        case let (.network(l), .network(r)):
+            return l == r
+        case let (.liveTS(l), .liveTS(r)):
+            return l == r
+        case let (.segmented(l), .segmented(r)):
+            return l == r
+        case let (.split(video: lv, audio: la), .split(video: rv, audio: ra)):
+            return sameUnderlyingAsset(lv, rv) && sameUnderlyingAsset(la, ra)
+        default:
+            return false
+        }
     }
 }
