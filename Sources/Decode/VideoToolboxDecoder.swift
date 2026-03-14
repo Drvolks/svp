@@ -30,6 +30,32 @@ public actor VideoToolboxDecoder: VideoDecoder {
             activeCodec = packet.formatHint
         }
 
+        // First attempt
+        do {
+            return try await decodeFrame(packet)
+        } catch let error as VideoDecodeError {
+            // Check if it's a recoverable decode error
+            if case .decodeFailed(let status) = error, isRecoverableDecodeError(status) {
+                #if DEBUG
+                print("[SVP] decode: recoverable error \(status), resetting session and retrying")
+                #endif
+                // Reset session and retry once
+                resetDecoderState()
+                do {
+                    return try await decodeFrame(packet)
+                } catch {
+                    // Retry also failed - skip this frame to allow video to continue
+                    #if DEBUG
+                    print("[SVP] decode: retry failed \(status), skipping frame")
+                    #endif
+                    return nil
+                }
+            }
+            throw error
+        }
+    }
+
+    private func decodeFrame(_ packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
         captureParameterSets(from: packet.data, codec: packet.formatHint, isCodecConfig: false)
         // Also check codecConfig (extradata) for parameter sets
         #if DEBUG
@@ -45,14 +71,27 @@ public actor VideoToolboxDecoder: VideoDecoder {
             #if DEBUG
             print("[SVP] decode: after extradata hasSPS=\(h264SPS != nil) hasPPS=\(h264PPS != nil)")
             #endif
+        } else {
+            #if DEBUG
+            print("[SVP] decode: NO codecConfig!")
+            #endif
         }
         try ensureSession(codec: packet.formatHint)
+        #if DEBUG
+        print("[SVP] decode: formatDescription=\(formatDescription != nil) session=\(session != nil)")
+        #endif
         guard let session, let formatDescription else {
             throw VideoDecodeError.needMoreData
         }
 
-        let sampleData = NALUnitCodec.annexBToLengthPrefixed(packet.data) ?? packet.data
-        let pts = CMTime(value: ptsValue, timescale: 90_000)
+        // Handle both Annex-B and length-prefixed formats from FFmpeg
+        let sampleData = NALUnitCodec.convertToLengthPrefixed(packet.data) ?? packet.data
+        #if DEBUG
+        let first4 = [UInt8](sampleData.prefix(8))
+        let first4Hex = first4.map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("[SVP] decode: sampleData first8=\(first4Hex) isKeyframe=\(packet.isKeyframe) pts=\(packet.pts ?? -1)")
+        #endif
+        let pts = CMTime(value: packet.pts ?? 0, timescale: 90_000)
         let dts = packet.dts.map { CMTime(value: $0, timescale: 90_000) } ?? .invalid
         let duration = packet.duration.map { CMTime(value: $0, timescale: 90_000) } ?? .invalid
         let sampleBuffer = try makeSampleBuffer(
@@ -92,6 +131,13 @@ public actor VideoToolboxDecoder: VideoDecoder {
         }
     }
 
+    private func isRecoverableDecodeError(_ status: OSStatus) -> Bool {
+        // kVTInvalidPictureErr = -8969
+        // kVTDecoderFailedErr = -12348
+        // kVTVideoDecoderMalfunctionErr = -15570
+        return status == -8969 || status == -12348 || status == -15570
+    }
+
     public func flush() async {
         if let session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
@@ -117,6 +163,11 @@ public actor VideoToolboxDecoder: VideoDecoder {
         // Packet data is Annex-B or length-prefixed format.
         // This function is called twice: first with packet.data (Annex-B), then with codecConfig (AVCC).
         // We only use AVCC parsing for codecConfig, never for packet.data.
+
+
+        #if DEBUG
+        print("[SVP] captureParameterSets: start codec=\(codec)")
+        #endif
 
         // First, try Annex-B/length-prefixed parsing (works for packet.data)
         let annexBUnits = NALUnitCodec.extractAnnexBNALUnits(data)
@@ -160,15 +211,6 @@ public actor VideoToolboxDecoder: VideoDecoder {
         if foundInPacketData {
             #if DEBUG
             print("[SVP] captureParameterSets: found in packet data sps=\(h264SPS?.count ?? hevcSPS?.count ?? 0)")
-            #endif
-            return
-        }
-
-        // Only try AVCC parsing for codecConfig/extradata (not for packet data)
-        // packet.data is in Annex-B or length-prefixed format, codecConfig is in AVCC format
-        guard isCodecConfig else {
-            #if DEBUG
-            print("[SVP] captureParameterSets: skipping AVCC parsing for packet data (not codecConfig)")
             #endif
             return
         }
@@ -423,30 +465,15 @@ private enum NALUnitCodec {
 
         // Byte 4: NALU length field size = (byte & 0x03) + 1
         var naluLengthSize = Int(bytes[4] & 0x03) + 1
-        guard naluLengthSize >= 1 && naluLengthSize <= 4 else {
-            #if DEBUG
-            print("[SVP] extractAVCCParameterSets: invalid naluLengthSize=\(naluLengthSize)")
-            #endif
-            return nil
-        }
+        #if DEBUG
+        print("[SVP] extractAVCCParameterSets: byte4=0x\(String(bytes[4], radix: 16)) naluLengthSize=\(naluLengthSize)")
+        #endif
 
-        // Special case: if naluLengthSize comes out to 4 but data suggests otherwise,
-        // try 2-byte lengths (common case)
-        // The data 0xFF at byte 4 is non-standard, so we need to handle it
-        if naluLengthSize == 4 && data.count >= 8 {
-            // Check if 2-byte length makes sense
-            let len2 = (Int(bytes[6]) << 8) | Int(bytes[7])
-            if len2 < 100 && 8 + len2 <= data.count {
-                // 2-byte length looks valid, use it
-                naluLengthSize = 2
-            }
-        }
-        guard naluLengthSize >= 1 && naluLengthSize <= 4 else {
-            #if DEBUG
-            print("[SVP] extractAVCCParameterSets: invalid naluLengthSize=\(naluLengthSize)")
-            #endif
-            return nil
-        }
+        // Use 4-byte NAL lengths to match the packet data format
+        naluLengthSize = 4
+        #if DEBUG
+        print("[SVP] extractAVCCParameterSets: using naluLengthSize=4")
+        #endif
 
         var offset = 5  // After version, profile, compatibility, level, nalLengthSize
         _ = Int(bytes[offset]) // numSPS - we assume 1 SPS for typical streams
@@ -619,8 +646,28 @@ private enum NALUnitCodec {
         return units
     }
 
-    static func annexBToLengthPrefixed(_ data: Data) -> Data? {
+    static func convertToLengthPrefixed(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
+        let bytes = [UInt8](data)
+        
+        // Check if it's already length-prefixed (4-byte big endian length)
+        // Valid length-prefixed: first 4 bytes are a valid length, not 0x00000001
+        if bytes.count >= 4 {
+            let length = (Int(bytes[0]) << 24) | (Int(bytes[1]) << 16) | (Int(bytes[2]) << 8) | Int(bytes[3])
+            if length > 0 && length <= bytes.count - 4 {
+                // Already length-prefixed format
+                #if DEBUG
+                print("[SVP] convertToLengthPrefixed: already length-prefixed, length=\(length)")
+                #endif
+                return data
+            }
+        }
+        
+        // Try Annex-B conversion
         let units = extractAnnexBNALUnits(data)
+        #if DEBUG
+        print("[SVP] convertToLengthPrefixed: Annex-B units.count=\(units.count)")
+        #endif
         guard !units.isEmpty else { return nil }
 
         var output = Data()
@@ -629,6 +676,28 @@ private enum NALUnitCodec {
             withUnsafeBytes(of: &length) { output.append(contentsOf: $0) }
             output.append(unit)
         }
+        #if DEBUG
+        print("[SVP] convertToLengthPrefixed: converted, output first8=\([UInt8](output.prefix(8)).map { String(format: "%02x", $0) }.joined(separator: " "))")
+        #endif
+        return output.isEmpty ? nil : output
+    }
+
+    static func annexBToLengthPrefixed(_ data: Data) -> Data? {
+        let units = extractAnnexBNALUnits(data)
+        #if DEBUG
+        print("[SVP] annexBToLengthPrefixed: input first4=\([UInt8](data.prefix(4)).map { String(format: "%02x", $0) }.joined(separator: " ")) units.count=\(units.count)")
+        #endif
+        guard !units.isEmpty else { return nil }
+
+        var output = Data()
+        for unit in units where !unit.isEmpty {
+            var length = UInt32(unit.count).bigEndian
+            withUnsafeBytes(of: &length) { output.append(contentsOf: $0) }
+            output.append(unit)
+        }
+        #if DEBUG
+        print("[SVP] annexBToLengthPrefixed: output first8=\([UInt8](output.prefix(8)).map { String(format: "%02x", $0) }.joined(separator: " "))")
+        #endif
         return output.isEmpty ? nil : output
     }
 

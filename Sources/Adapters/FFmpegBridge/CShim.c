@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <unistd.h>
 #if __has_include(<TargetConditionals.h>)
 #include <TargetConditionals.h>
 #endif
@@ -50,6 +51,30 @@ struct svp_ffmpeg_audio_decoder {
     int32_t pending_packet_length;
     int64_t pending_packet_pts90k;
     int64_t last_sent_packet_pts90k;
+};
+
+struct svp_ffmpeg_multi_demuxer {
+    AVFormatContext *video_fmt;
+    AVFormatContext *audio_fmt;
+    int32_t video_stream_idx;
+    int32_t audio_stream_idx;
+    int video_eof;
+    int audio_eof;
+    int64_t pending_video_pts90k;
+    int64_t pending_video_pts;
+    int64_t pending_video_dts;
+    int64_t pending_video_duration;
+    int pending_video_keyframe;
+    int pending_video_size;
+    int32_t pending_video_codec;
+    uint8_t *pending_video_data;
+    int64_t pending_audio_pts90k;
+    int64_t pending_audio_pts;
+    int64_t pending_audio_dts;
+    int64_t pending_audio_duration;
+    int pending_audio_size;
+    int32_t pending_audio_codec;
+    uint8_t *pending_audio_data;
 };
 
 /*
@@ -453,7 +478,7 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
 
     if (!g_svp_bridge_stamp_printed) {
         g_svp_bridge_stamp_printed = 1;
-        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T15:00\n");
+        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T18:45\n");
     }
 
     avformat_network_init();
@@ -493,6 +518,104 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
     return demuxer;
 #else
     (void)url;
+    return NULL;
+#endif
+}
+
+void *svp_ffmpeg_demuxer_create_multi(const char *video_url, const char *audio_url) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_multi_demuxer *demuxer;
+    AVFormatContext *videoFmt = NULL;
+    AVFormatContext *audioFmt = NULL;
+    AVDictionary *options = NULL;
+    int i;
+
+    if (video_url == NULL || audio_url == NULL) {
+        return NULL;
+    }
+
+    if (!g_svp_bridge_stamp_printed) {
+        g_svp_bridge_stamp_printed = 1;
+        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T18:45\n");
+    }
+
+    avformat_network_init();
+    av_dict_set(&options, "user_agent", "Tube2-SVP/1.0", 0);
+
+    pthread_mutex_lock(&g_ffmpeg_demux_mutex);
+    if (avformat_open_input(&videoFmt, video_url, NULL, &options) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        av_dict_free(&options);
+        return NULL;
+    }
+    av_dict_free(&options);
+
+    options = NULL;
+    av_dict_set(&options, "user_agent", "Tube2-SVP/1.0", 0);
+    if (avformat_open_input(&audioFmt, audio_url, NULL, &options) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        avformat_close_input(&videoFmt);
+        av_dict_free(&options);
+        return NULL;
+    }
+    av_dict_free(&options);
+
+    if (avformat_find_stream_info(videoFmt, NULL) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        avformat_close_input(&videoFmt);
+        avformat_close_input(&audioFmt);
+        return NULL;
+    }
+
+    if (avformat_find_stream_info(audioFmt, NULL) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        avformat_close_input(&videoFmt);
+        avformat_close_input(&audioFmt);
+        return NULL;
+    }
+    pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+
+    demuxer = (struct svp_ffmpeg_multi_demuxer *)calloc(1, sizeof(struct svp_ffmpeg_multi_demuxer));
+    if (demuxer == NULL) {
+        avformat_close_input(&videoFmt);
+        avformat_close_input(&audioFmt);
+        return NULL;
+    }
+
+    demuxer->video_fmt = videoFmt;
+    demuxer->audio_fmt = audioFmt;
+    demuxer->video_stream_idx = -1;
+    demuxer->audio_stream_idx = -1;
+    demuxer->video_eof = 0;
+    demuxer->audio_eof = 0;
+    demuxer->pending_video_pts90k = AV_NOPTS_VALUE;
+    demuxer->pending_audio_pts90k = AV_NOPTS_VALUE;
+
+    for (i = 0; i < (int32_t)videoFmt->nb_streams; i++) {
+        if (videoFmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            demuxer->video_stream_idx = i;
+            break;
+        }
+    }
+
+    for (i = 0; i < (int32_t)audioFmt->nb_streams; i++) {
+        if (audioFmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            demuxer->audio_stream_idx = i;
+            break;
+        }
+    }
+
+    if (demuxer->video_stream_idx < 0 || demuxer->audio_stream_idx < 0) {
+        avformat_close_input(&videoFmt);
+        avformat_close_input(&audioFmt);
+        free(demuxer);
+        return NULL;
+    }
+
+    return demuxer;
+#else
+    (void)video_url;
+    (void)audio_url;
     return NULL;
 #endif
 }
@@ -594,6 +717,109 @@ void svp_ffmpeg_codec_config_release(svp_ffmpeg_codec_config_t *config) {
         config->data = NULL;
     }
     config->size = 0;
+}
+
+int32_t svp_ffmpeg_multi_demuxer_stream_count(void *demuxerHandle) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_multi_demuxer *demuxer = (struct svp_ffmpeg_multi_demuxer *)demuxerHandle;
+    if (demuxer == NULL) {
+        return -1;
+    }
+    int count = 0;
+    if (demuxer->video_fmt != NULL && demuxer->video_stream_idx >= 0) {
+        count++;
+    }
+    if (demuxer->audio_fmt != NULL && demuxer->audio_stream_idx >= 0) {
+        count++;
+    }
+    return count;
+#else
+    (void)demuxerHandle;
+    return -38;
+#endif
+}
+
+int32_t svp_ffmpeg_multi_demuxer_stream_info(void *demuxerHandle, int32_t index, svp_ffmpeg_stream_info_t *outInfo) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_multi_demuxer *demuxer = (struct svp_ffmpeg_multi_demuxer *)demuxerHandle;
+    AVStream *stream = NULL;
+
+    if (demuxer == NULL || outInfo == NULL) {
+        return -1;
+    }
+
+    if (index == 0) {
+        if (demuxer->video_fmt != NULL && demuxer->video_stream_idx >= 0) {
+            stream = demuxer->video_fmt->streams[demuxer->video_stream_idx];
+        }
+    } else if (index == 1) {
+        if (demuxer->audio_fmt != NULL && demuxer->audio_stream_idx >= 0) {
+            stream = demuxer->audio_fmt->streams[demuxer->audio_stream_idx];
+        }
+    }
+
+    if (stream == NULL) {
+        return -2;
+    }
+
+    memset(outInfo, 0, sizeof(*outInfo));
+    outInfo->streamIndex = index;
+    outInfo->streamID = stream->id;
+    outInfo->streamKind = map_ffmpeg_media_type_to_bridge(stream->codecpar->codec_type);
+    outInfo->codecID = map_ffmpeg_codec_to_bridge(stream->codecpar->codec_id);
+    outInfo->timebaseNum = stream->time_base.num;
+    outInfo->timebaseDen = stream->time_base.den;
+    return 0;
+#else
+    (void)demuxerHandle;
+    (void)index;
+    (void)outInfo;
+    return -38;
+#endif
+}
+
+int32_t svp_ffmpeg_multi_demuxer_stream_codec_config(void *demuxerHandle, int32_t index, svp_ffmpeg_codec_config_t *outConfig) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_multi_demuxer *demuxer = (struct svp_ffmpeg_multi_demuxer *)demuxerHandle;
+    AVStream *stream = NULL;
+    AVFormatContext *fmt = NULL;
+
+    if (demuxer == NULL || outConfig == NULL) {
+        return -1;
+    }
+
+    if (index == 0) {
+        fmt = demuxer->video_fmt;
+        if (fmt != NULL && demuxer->video_stream_idx >= 0) {
+            stream = fmt->streams[demuxer->video_stream_idx];
+        }
+    } else if (index == 1) {
+        fmt = demuxer->audio_fmt;
+        if (fmt != NULL && demuxer->audio_stream_idx >= 0) {
+            stream = fmt->streams[demuxer->audio_stream_idx];
+        }
+    }
+
+    if (stream == NULL) {
+        return -2;
+    }
+
+    memset(outConfig, 0, sizeof(*outConfig));
+    if (stream->codecpar->extradata_size > 0) {
+        outConfig->size = stream->codecpar->extradata_size;
+        outConfig->data = (uint8_t *)malloc((size_t)stream->codecpar->extradata_size);
+        if (outConfig->data) {
+            memcpy(outConfig->data, stream->codecpar->extradata, (size_t)stream->codecpar->extradata_size);
+            return 1;
+        }
+    }
+    return 0;
+#else
+    (void)demuxerHandle;
+    (void)index;
+    (void)outConfig;
+    return -38;
+#endif
 }
 
 int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_packet_t *outPacket) {
@@ -711,6 +937,206 @@ int32_t svp_ffmpeg_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_p
     (void)demuxerHandle;
     (void)outPacket;
     return -38;
+#endif
+}
+
+int32_t svp_ffmpeg_multi_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_demuxed_packet_t *outPacket) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_multi_demuxer *demuxer = (struct svp_ffmpeg_multi_demuxer *)demuxerHandle;
+    AVPacket *packet;
+    int readStatus;
+    int is_video;
+    int64_t video_pts90k;
+    int64_t audio_pts90k;
+
+    if (demuxer == NULL || outPacket == NULL) {
+        return -1;
+    }
+    memset(outPacket, 0, sizeof(*outPacket));
+
+    packet = av_packet_alloc();
+    if (packet == NULL) {
+        return -2;
+    }
+
+    while (1) {
+        if (demuxer->video_eof && demuxer->audio_eof) {
+            av_packet_free(&packet);
+            return 0;
+        }
+
+        if (!demuxer->video_eof && demuxer->pending_video_pts90k == AV_NOPTS_VALUE) {
+            while (!demuxer->video_eof) {
+                pthread_mutex_lock(&g_ffmpeg_demux_mutex);
+                readStatus = av_read_frame(demuxer->video_fmt, packet);
+                pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+                if (readStatus == AVERROR_EOF) {
+                    demuxer->video_eof = 1;
+                    break;
+                } else if (readStatus < 0) {
+                    demuxer->video_eof = 1;
+                    break;
+                } else if (packet->stream_index == demuxer->video_stream_idx) {
+                    if (packet->pts != AV_NOPTS_VALUE) {
+                        AVStream *video_stream = demuxer->video_fmt->streams[demuxer->video_stream_idx];
+                        fprintf(stderr, "[SVP][FFmpegBridge] VIDEO stream timebase: %d/%d\n", video_stream->time_base.num, video_stream->time_base.den);
+                        demuxer->pending_video_pts90k = av_rescale_q(packet->pts, video_stream->time_base, (AVRational){1, 90000});
+                        demuxer->pending_video_pts = demuxer->pending_video_pts90k;
+                        if (packet->dts != AV_NOPTS_VALUE && packet->dts >= 0) {
+                            demuxer->pending_video_dts = av_rescale_q(packet->dts, video_stream->time_base, (AVRational){1, 90000});
+                        } else {
+                            demuxer->pending_video_dts = demuxer->pending_video_pts90k;
+                        }
+                        demuxer->pending_video_duration = av_rescale_q(packet->duration, video_stream->time_base, (AVRational){1, 90000});
+                        // Detect keyframe from NAL unit type (for length-prefixed format)
+                        int isKeyframe = (packet->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+                        if (!isKeyframe && packet->size > 4) {
+                            // Check NAL unit type: type 5 = IDR, type 7 = SPS, type 8 = PPS
+                            uint8_t firstByte = packet->data[4];
+                            uint8_t nalType = firstByte & 0x1F;
+                            fprintf(stderr, "[SVP][FFmpegBridge] NAL_type=%d firstByte=%02x\n", nalType, firstByte);
+                            if (nalType == 5 || nalType == 7 || nalType == 8) {
+                                isKeyframe = 1;
+                            }
+                        }
+                        demuxer->pending_video_keyframe = isKeyframe;
+                        fprintf(stderr, "[SVP][FFmpegBridge] read_video_packet: FFmpeg_flags=%d AV_PKT_FLAG_KEY=%d isKeyframe=%d\n",
+                                packet->flags, AV_PKT_FLAG_KEY, isKeyframe);
+                        demuxer->pending_video_size = packet->size;
+                        demuxer->pending_video_codec = map_ffmpeg_codec_to_bridge(video_stream->codecpar->codec_id);
+                        demuxer->pending_video_data = (uint8_t *)malloc((size_t)packet->size);
+                        if (demuxer->pending_video_data) {
+                            memcpy(demuxer->pending_video_data, packet->data, (size_t)packet->size);
+                        }
+                        fprintf(stderr, "[SVP][FFmpegBridge] read_video_packet: pts=%lld dts=%lld pts90k=%lld dts90k=%lld size=%d keyframe=%d\n",
+                                (long long)packet->pts, (long long)packet->dts,
+                                (long long)demuxer->pending_video_pts90k, (long long)demuxer->pending_video_dts,
+                                packet->size, demuxer->pending_video_keyframe);
+                        break;
+                    }
+                }
+                av_packet_unref(packet);
+            }
+        }
+
+        if (!demuxer->audio_eof && demuxer->pending_audio_pts90k == AV_NOPTS_VALUE) {
+            while (!demuxer->audio_eof) {
+                pthread_mutex_lock(&g_ffmpeg_demux_mutex);
+                readStatus = av_read_frame(demuxer->audio_fmt, packet);
+                pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+                if (readStatus == AVERROR_EOF) {
+                    demuxer->audio_eof = 1;
+                    break;
+                } else if (readStatus < 0) {
+                    demuxer->audio_eof = 1;
+                    break;
+                } else if (packet->stream_index == demuxer->audio_stream_idx) {
+                    if (packet->pts != AV_NOPTS_VALUE) {
+                        AVStream *audio_stream = demuxer->audio_fmt->streams[demuxer->audio_stream_idx];
+                        fprintf(stderr, "[SVP][FFmpegBridge] AUDIO stream timebase: %d/%d\n", audio_stream->time_base.num, audio_stream->time_base.den);
+                        demuxer->pending_audio_pts90k = av_rescale_q(packet->pts, audio_stream->time_base, (AVRational){1, 90000});
+                        demuxer->pending_audio_pts = demuxer->pending_audio_pts90k;
+                        demuxer->pending_audio_dts = (packet->dts != AV_NOPTS_VALUE) ? av_rescale_q(packet->dts, audio_stream->time_base, (AVRational){1, 90000}) : demuxer->pending_audio_pts90k;
+                        demuxer->pending_audio_duration = av_rescale_q(packet->duration, audio_stream->time_base, (AVRational){1, 90000});
+                        demuxer->pending_audio_size = packet->size;
+                        demuxer->pending_audio_codec = map_ffmpeg_codec_to_bridge(audio_stream->codecpar->codec_id);
+                        demuxer->pending_audio_data = (uint8_t *)malloc((size_t)packet->size);
+                        if (demuxer->pending_audio_data) {
+                            memcpy(demuxer->pending_audio_data, packet->data, (size_t)packet->size);
+                        }
+                        fprintf(stderr, "[SVP][FFmpegBridge] read_audio_packet: pts=%lld pts90k=%lld size=%d\n",
+                                (long long)packet->pts, (long long)demuxer->pending_audio_pts90k, packet->size);
+                        break;
+                    }
+                }
+                av_packet_unref(packet);
+            }
+        }
+
+        video_pts90k = demuxer->pending_video_pts90k;
+        audio_pts90k = demuxer->pending_audio_pts90k;
+
+        // Output whichever has earlier PTS, not just video first
+        if (video_pts90k != AV_NOPTS_VALUE && audio_pts90k != AV_NOPTS_VALUE) {
+            // Both have data - output the earlier one
+            if (video_pts90k <= audio_pts90k) {
+                is_video = 1;
+                outPacket->streamIndex = 0;
+                outPacket->codecID = demuxer->pending_video_codec;
+                outPacket->pts = demuxer->pending_video_pts90k;
+                outPacket->dts = demuxer->pending_video_pts90k;
+                outPacket->duration = demuxer->pending_video_duration;
+                outPacket->isKeyframe = demuxer->pending_video_keyframe;
+                outPacket->size = demuxer->pending_video_size;
+                outPacket->hasPTS = 1;
+                outPacket->hasDTS = 1;
+                outPacket->hasDuration = demuxer->pending_video_duration > 0 ? 1 : 0;
+                outPacket->data = demuxer->pending_video_data;
+                demuxer->pending_video_data = NULL;
+                demuxer->pending_video_pts90k = AV_NOPTS_VALUE;
+                fprintf(stderr, "[SVP][FFmpegBridge] output_video_packet: pts90k=%lld size=%d keyframe=%d\n",
+                        (long long)outPacket->pts, outPacket->size, outPacket->isKeyframe);
+                av_packet_free(&packet);
+                return 1;
+            } else {
+                is_video = 0;
+                outPacket->streamIndex = 1;
+                outPacket->codecID = demuxer->pending_audio_codec;
+                outPacket->pts = demuxer->pending_audio_pts90k;
+                outPacket->dts = demuxer->pending_audio_pts90k;
+                outPacket->duration = demuxer->pending_audio_duration;
+                outPacket->isKeyframe = 0;
+                outPacket->size = demuxer->pending_audio_size;
+                outPacket->hasPTS = 1;
+                outPacket->hasDTS = 1;
+                outPacket->hasDuration = demuxer->pending_audio_duration > 0 ? 1 : 0;
+                outPacket->data = demuxer->pending_audio_data;
+                demuxer->pending_audio_data = NULL;
+                demuxer->pending_audio_pts90k = AV_NOPTS_VALUE;
+                fprintf(stderr, "[SVP][FFmpegBridge] output_audio_packet: pts90k=%lld size=%d\n",
+                        (long long)outPacket->pts, outPacket->size);
+                av_packet_free(&packet);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "[SVP][FFmpegBridge] no_packet: video_eof=%d audio_eof=%d video_pts90k=%lld audio_pts90k=%lld\n",
+                    demuxer->video_eof, demuxer->audio_eof,
+                    (long long)demuxer->pending_video_pts90k,
+                    (long long)demuxer->pending_audio_pts90k);
+            av_packet_free(&packet);
+            return 0;
+        }
+
+        usleep(1000);
+    }
+#else
+    (void)demuxerHandle;
+    (void)outPacket;
+    return -38;
+#endif
+}
+
+void svp_ffmpeg_multi_demuxer_destroy(void *demuxerHandle) {
+#if SVP_HAS_VENDOR_FFMPEG
+    struct svp_ffmpeg_multi_demuxer *demuxer = (struct svp_ffmpeg_multi_demuxer *)demuxerHandle;
+    if (demuxer == NULL) {
+        return;
+    }
+    if (demuxer->video_fmt != NULL) {
+        avformat_close_input(&demuxer->video_fmt);
+    }
+    if (demuxer->audio_fmt != NULL) {
+        avformat_close_input(&demuxer->audio_fmt);
+    }
+    if (demuxer->pending_video_data != NULL) {
+        free(demuxer->pending_video_data);
+    }
+    if (demuxer->pending_audio_data != NULL) {
+        free(demuxer->pending_audio_data);
+    }
+    free(demuxer);
+#else
+    (void)demuxerHandle;
 #endif
 }
 

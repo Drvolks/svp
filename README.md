@@ -65,6 +65,46 @@ try await player.load(source)
 await player.play()
 ```
 
+### YouTube-Style Dual Stream Integration
+
+For YouTube or similar streams with separate video/audio URLs:
+
+```swift
+import SVP
+import Input
+import PlayerCore
+import Render
+import Demux
+import Foundation
+
+let videoURL = URL(string: "https://.../video.mp4")!
+let audioURL = URL(string: "https://.../audio.m4a")!
+
+let videoInput = HTTPInputSource(url: videoURL)
+let audioInput = HTTPInputSource(url: audioURL)
+
+let player = Player(
+    videoSource: videoInput,
+    audioSource: audioInput,
+    preferHardwareDecode: true
+)
+
+let videoRenderer = MetalRenderer()
+await player.attachVideoOutput(videoRenderer)
+
+let source = PlayableSource(
+    descriptor: MediaSourceDescriptor(
+        kind: .split(video: .network(videoURL), audio: .network(audioURL)),
+        isLive: false,
+        streams: [],
+        preferredClock: .audio
+    )
+)
+
+try await player.load(source)
+await player.play()
+```
+
 ## PiP Integration (Sample Buffer Path)
 
 `PiPBridge` is available as a `VideoOutput`:
@@ -89,10 +129,63 @@ For each app (`Tube` / `NexusPVR`):
 
 ## Source Types Available
 
-- `FileInputSource`
-- `HTTPInputSource`
-- `LiveTSInputSource`
-- `SegmentedInputSource`
+- `FileInputSource` - Local file playback
+- `HTTPInputSource` - Network stream playback
+- `LiveTSInputSource` - Live transport stream (single URL)
+- `SegmentedInputSource` - HLS/DASH segmented streams
+- `FFmpegDemuxAdapter` - FFmpeg-based demuxer with support for:
+  - Single URL (local file, network stream, HLS)
+  - **Dual URL** (YouTube-style separate video/audio streams)
+
+## Unified FFmpeg Input Source
+
+SVP includes a unified FFmpeg demuxer that handles both single and dual-input streams:
+
+### Single URL Mode
+For local files, network streams, or HLS:
+```swift
+let demux = FFmpegDemuxAdapter(url: videoURL)
+```
+
+### Dual URL Mode (YouTube)
+For streams with separate video/audio URLs (like YouTube):
+```swift
+let demux = FFmpegDemuxAdapter(videoURL: videoURL, audioURL: audioURL)
+```
+
+### Architecture Benefits
+
+1. **PTS/DTS Preservation**: Opens both video and audio URLs in a single FFmpeg context, preserving the timing relationships needed for proper video decode
+2. **Hardware Decode Support**: With correct PTS/DTS, VideoToolbox hardware decoder works properly (no more -8969 reference frame errors)
+3. **Automatic HLS Detection**: Automatically detects m3u8/HLS streams and uses the appropriate demuxer
+
+### How It Works
+
+```
+YouTube URLs (separate video + audio)
+           │
+           ▼
+┌──────────────────────────────┐
+│ FFmpegDemuxAdapter           │
+│ - Opens video URL            │
+│ - Opens audio URL            │
+│ - Creates unified TS context │
+│ - Preserves PTS/DTS         │
+└──────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│ Single packet stream         │
+│ with correct timing         │
+└──────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│ VideoToolbox (hardware)      │
+│ - Reference frames intact   │
+│ - Decode works!             │
+└──────────────────────────────┘
+```
 
 ## What Is Production-Ready vs Scaffold
 
@@ -103,11 +196,12 @@ Implemented:
 - PiP output bridge primitives (`DecodedVideoFrame -> CMSampleBuffer`)
 
 Scaffold / to complete:
-- Real FFmpeg demux/decode integration
 - Full TS demux logic (PAT/PMT/PCR/PES/discontinuities)
 - Hardware decode fallback strategy with real pixel buffers
 - A/V sync tuning for unstable live streams
 - Error recovery and telemetry
+
+Note: The FFmpeg demux/decode integration is now implemented via the unified FFmpeg input source, supporting both single and dual URL modes for YouTube-style streams.
 
 ## Build
 

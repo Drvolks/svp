@@ -17,9 +17,12 @@ extension FFmpegDemuxError: PlaybackCategorizedError {
 }
 
 public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
-    private static let buildStamp = "SVP_LOCAL_2026-03-13T15:00"
+    private static let buildStamp = "SVP_LOCAL_2026-03-13T19:45"
     private static let reorderBufferSize = 8
-    private let url: URL
+    private let url: URL?
+    private let videoURL: URL?
+    private let audioURL: URL?
+    private let isMultiInput: Bool
     private let handleBox = FFmpegDemuxerHandleBox()
     private var streamInfoByIndex: [Int32: svp_ffmpeg_stream_info_t] = [:]
     private var streamCodecConfigByIndex: [Int32: Data] = [:]
@@ -30,6 +33,16 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
 
     public init(url: URL) {
         self.url = url
+        self.videoURL = nil
+        self.audioURL = nil
+        self.isMultiInput = false
+    }
+
+    public init(videoURL: URL, audioURL: URL) {
+        self.url = nil
+        self.videoURL = videoURL
+        self.audioURL = audioURL
+        self.isMultiInput = true
     }
 
     public func makePacketStream() -> AsyncThrowingStream<DemuxedPacket, Error> {
@@ -66,7 +79,12 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                                 throw FFmpegDemuxError.openFailed(reason: "demux handle is nil after open")
                             }
                             var rawPacket = svp_ffmpeg_demuxed_packet_t()
-                            let status = svp_ffmpeg_demuxer_read_packet(handle, &rawPacket)
+                            let status: Int32
+                            if self.isMultiInput {
+                                status = svp_ffmpeg_multi_demuxer_read_packet(handle, &rawPacket)
+                            } else {
+                                status = svp_ffmpeg_demuxer_read_packet(handle, &rawPacket)
+                            }
                             if status == 0 {
                                 await self.log("packet_stream_eof")
                                 eofReached = true
@@ -76,7 +94,31 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                                 await self.log("read_packet_failed status=\(status)")
                                 throw FFmpegDemuxError.readFailed(status)
                             }
-                            if let packet = await self.makePacket(from: rawPacket) {
+                            let packetSize = rawPacket.size
+                            let packetData: Data? = packetSize > 0 && rawPacket.data != nil
+                                ? Data(bytes: rawPacket.data!, count: Int(packetSize)) : nil
+                            let packetStreamIndex = rawPacket.streamIndex
+                            let packetCodecID = rawPacket.codecID
+                            let packetPTS = rawPacket.pts
+                            let packetDTS = rawPacket.dts
+                            let packetDuration = rawPacket.duration
+                            let packetHasPTS = rawPacket.hasPTS
+                            let packetHasDTS = rawPacket.hasDTS
+                            let packetHasDuration = rawPacket.hasDuration
+                            let packetIsKeyframe = rawPacket.isKeyframe
+                            svp_ffmpeg_demuxed_packet_release(&rawPacket)
+                            if let data = packetData, let packet = await self.makePacketFromData(
+                                data: data,
+                                streamIndex: packetStreamIndex,
+                                codecID: packetCodecID,
+                                pts: packetPTS,
+                                dts: packetDTS,
+                                duration: packetDuration,
+                                hasPTS: packetHasPTS,
+                                hasDTS: packetHasDTS,
+                                hasDuration: packetHasDuration,
+                                isKeyframe: packetIsKeyframe
+                            ) {
                                 await self.addToReorderBuffer(packet)
                             }
                             bufferCount = await self.getReorderBufferCount()
@@ -140,15 +182,38 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         guard svp_ffmpeg_bridge_has_vendor_backend() == 1 else {
             throw FFmpegDemuxError.openFailed(reason: "vendor ffmpeg backend unavailable")
         }
-        let pathString = sourcePath(url)
-        log("open_demux source=\(pathString)")
-        let created = pathString.withCString { svp_ffmpeg_demuxer_create($0) }
-        guard let created else {
-            throw FFmpegDemuxError.openFailed(
-                reason: "avformat open failed for source=\(pathString)"
-            )
+
+        let created: UnsafeMutableRawPointer?
+        if isMultiInput {
+            guard let videoURL = videoURL, let audioURL = audioURL else {
+                throw FFmpegDemuxError.openFailed(reason: "multi input missing URLs")
+            }
+            let videoPath = sourcePath(videoURL)
+            let audioPath = sourcePath(audioURL)
+            log("open_demux_multi video=\(videoPath) audio=\(audioPath)")
+            created = videoPath.withCString { videoCStr in
+                audioPath.withCString { audioCStr in
+                    svp_ffmpeg_demuxer_create_multi(videoCStr, audioCStr)
+                }
+            }
+            guard let created else {
+                throw FFmpegDemuxError.openFailed(reason: "avformat open failed for multi input")
+            }
+        } else {
+            guard let url = url else {
+                throw FFmpegDemuxError.openFailed(reason: "single input missing URL")
+            }
+            let pathString = sourcePath(url)
+            log("open_demux source=\(pathString)")
+            created = pathString.withCString { svp_ffmpeg_demuxer_create($0) }
+            guard let created else {
+                throw FFmpegDemuxError.openFailed(
+                    reason: "avformat open failed for source=\(pathString)"
+                )
+            }
         }
         handleBox.raw = created
+        handleBox.isMultiInput = isMultiInput
         try loadStreamInfo()
         log("open_demux_ok stream_count=\(streamInfoByIndex.count)")
     }
@@ -157,7 +222,12 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         guard let handle = handleBox.raw else {
             throw FFmpegDemuxError.openFailed(reason: "stream info requested with nil handle")
         }
-        let count = svp_ffmpeg_demuxer_stream_count(handle)
+        let count: Int32
+        if isMultiInput {
+            count = svp_ffmpeg_multi_demuxer_stream_count(handle)
+        } else {
+            count = svp_ffmpeg_demuxer_stream_count(handle)
+        }
         guard count >= 0 else {
             throw FFmpegDemuxError.streamInfoFailed(count)
         }
@@ -165,13 +235,23 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         var codecConfigs: [Int32: Data] = [:]
         for index in 0..<count {
             var info = svp_ffmpeg_stream_info_t()
-            let status = svp_ffmpeg_demuxer_stream_info(handle, index, &info)
+            let status: Int32
+            if isMultiInput {
+                status = svp_ffmpeg_multi_demuxer_stream_info(handle, index, &info)
+            } else {
+                status = svp_ffmpeg_demuxer_stream_info(handle, index, &info)
+            }
             guard status == 0 else {
                 throw FFmpegDemuxError.streamInfoFailed(status)
             }
             mapped[index] = info
             var codecConfig = svp_ffmpeg_codec_config_t()
-            let configStatus = svp_ffmpeg_demuxer_stream_codec_config(handle, index, &codecConfig)
+            let configStatus: Int32
+            if isMultiInput {
+                configStatus = svp_ffmpeg_multi_demuxer_stream_codec_config(handle, index, &codecConfig)
+            } else {
+                configStatus = svp_ffmpeg_demuxer_stream_codec_config(handle, index, &codecConfig)
+            }
             if configStatus > 0, let data = codecConfig.data, codecConfig.size > 0 {
                 codecConfigs[index] = Data(bytes: data, count: Int(codecConfig.size))
             }
@@ -215,6 +295,85 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             sideData: packetSideData,
             sideDataType: rawPacket.sideDataType > 0 ? rawPacket.sideDataType : nil,
             isKeyframe: rawPacket.isKeyframe == 1,
+            formatHint: codec
+        )
+    }
+
+    private func makePacketFromData(
+        data: Data,
+        streamIndex: Int32,
+        codecID: Int32,
+        pts: Int64,
+        dts: Int64,
+        duration: Int64,
+        hasPTS: Int32,
+        hasDTS: Int32,
+        hasDuration: Int32,
+        isKeyframe: Int32
+    ) -> DemuxedPacket? {
+        let info = streamInfoByIndex[streamIndex]
+        let timebaseNum = Int64(info?.timebaseNum ?? 1)
+        let timebaseDen = Int64(info?.timebaseDen ?? 90_000)
+        let streamCodec = mapCodec(info?.codecID ?? 0)
+        let packetCodec = mapCodec(codecID)
+        let codec = packetCodec == .unknown ? streamCodec : packetCodec
+
+        // For multi-input, PTS is already in 90kHz from C code - no scaling needed
+        let normalizedPTS: Int64? = hasPTS == 1 ? pts : nil
+        let normalizedDTS: Int64? = hasDTS == 1 ? dts : nil
+
+        return DemuxedPacket(
+            streamID: StreamID(Int(streamIndex)),
+            pts: normalizedPTS,
+            dts: normalizedDTS,
+            duration: hasDuration == 1 ? duration : nil,
+            data: data,
+            codecConfig: streamCodecConfigByIndex[streamIndex],
+            sideData: nil,
+            sideDataType: nil,
+            isKeyframe: isKeyframe == 1,
+            formatHint: codec
+        )
+    }
+
+    private func makePacketFromRawData(
+        data: UnsafeMutableRawPointer?,
+        size: Int32,
+        streamIndex: Int32,
+        codecID: Int32,
+        pts: Int64,
+        dts: Int64,
+        duration: Int64,
+        hasPTS: Int32,
+        hasDTS: Int32,
+        hasDuration: Int32,
+        isKeyframe: Int32
+    ) -> DemuxedPacket? {
+        guard size > 0, let dataPtr = data else { return nil }
+
+        let packetData = Data(bytes: dataPtr, count: Int(size))
+        let info = streamInfoByIndex[streamIndex]
+        let timebaseNum = Int64(info?.timebaseNum ?? 1)
+        let timebaseDen = Int64(info?.timebaseDen ?? 90_000)
+        let streamCodec = mapCodec(info?.codecID ?? 0)
+        let packetCodec = mapCodec(codecID)
+        let codec = packetCodec == .unknown ? streamCodec : packetCodec
+
+        let scaledPTS = hasPTS == 1 ? scaleTo90k(pts, num: timebaseNum, den: timebaseDen) : nil
+        let scaledDTS = hasDTS == 1 ? scaleTo90k(dts, num: timebaseNum, den: timebaseDen) : nil
+        let normalizedPTS = scaledPTS ?? scaledDTS
+        let normalizedDTS = scaledDTS ?? scaledPTS
+
+        return DemuxedPacket(
+            streamID: StreamID(Int(streamIndex)),
+            pts: normalizedPTS,
+            dts: normalizedDTS,
+            duration: hasDuration == 1 ? scaleTo90k(duration, num: timebaseNum, den: timebaseDen) : nil,
+            data: packetData,
+            codecConfig: streamCodecConfigByIndex[streamIndex],
+            sideData: nil,
+            sideDataType: nil,
+            isKeyframe: isKeyframe == 1,
             formatHint: codec
         )
     }
@@ -299,10 +458,15 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
 
 private final class FFmpegDemuxerHandleBox: @unchecked Sendable {
     nonisolated(unsafe) var raw: UnsafeMutableRawPointer?
+    var isMultiInput: Bool = false
 
     deinit {
         if let raw {
-            svp_ffmpeg_demuxer_destroy(raw)
+            if isMultiInput {
+                svp_ffmpeg_multi_demuxer_destroy(raw)
+            } else {
+                svp_ffmpeg_demuxer_destroy(raw)
+            }
         }
     }
 }

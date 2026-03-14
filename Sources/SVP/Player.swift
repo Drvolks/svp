@@ -26,13 +26,32 @@ public actor Player: PlayerEngine {
     }
 
     public init(videoSource: any InputSource, audioSource: any InputSource, preferHardwareDecode: Bool = true) {
-        let coalescedKind = Self.sameUnderlyingAsset(videoSource.descriptor.kind, audioSource.descriptor.kind)
-            ? videoSource.descriptor.kind
+        let videoKind = videoSource.descriptor.kind
+        let audioKind = audioSource.descriptor.kind
+        let coalescedKind = Self.sameUnderlyingAsset(videoKind, audioKind)
+            ? videoKind
             : nil
         let demux: any DemuxEngine
+
+        #if DEBUG
+        print("[SVP][Player] init dual: videoKind=\(videoKind) audioKind=\(audioKind) sameUnderlying=\(coalescedKind != nil)")
+        #endif
+
         if coalescedKind != nil {
+            #if DEBUG
+            print("[SVP][Player] using single demux (same underlying)")
+            #endif
             demux = Self.makeDemuxEngine(for: videoSource)
+        } else if let videoURL = Self.extractURL(from: videoKind),
+                  let audioURL = Self.extractURL(from: audioKind) {
+            #if DEBUG
+            print("[SVP][Player] using unified FFmpegDemuxAdapter: video=\(videoURL) audio=\(audioURL)")
+            #endif
+            demux = FFmpegDemuxAdapter(videoURL: videoURL, audioURL: audioURL)
         } else {
+            #if DEBUG
+            print("[SVP][Player] using SplitAVInputSource path")
+            #endif
             let compositeSource = SplitAVInputSource(videoSource: videoSource, audioSource: audioSource)
             demux = Self.makeDemuxEngine(for: compositeSource)
         }
@@ -45,6 +64,21 @@ public actor Player: PlayerEngine {
         let defaultAudioRenderer = self.defaultAudioRenderer
         Task {
             await session.attachAudioOutput(defaultAudioRenderer)
+        }
+    }
+
+    private static func extractURL(from kind: SourceKind) -> URL? {
+        switch kind {
+        case .file(let url):
+            return url
+        case .network(let url):
+            return url
+        case .liveTS(let url):
+            return url
+        case .segmented(let urls):
+            return urls.first
+        case .split:
+            return nil
         }
     }
 

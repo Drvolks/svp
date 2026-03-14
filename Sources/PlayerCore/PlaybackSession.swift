@@ -553,7 +553,7 @@ public actor PlaybackSession: PlayerEngine {
             // Increased for better buffering in live mode
             videoCapacity = hasAudio ? 240 : 360
             videoOverflowPolicy = .preferKeyframes
-            videoFrameCapacity = hasAudio ? 24 : 36
+            videoFrameCapacity = hasAudio ? 24 : 30
             videoFrameOverflowPolicy = .blockProducer
         } else if isSplitSource && hasAudio {
             // Split VOD (separate video/audio URLs): keep packet ordering stable
@@ -561,11 +561,11 @@ public actor PlaybackSession: PlayerEngine {
             videoCapacity = 180
             videoOverflowPolicy = .blockProducer
             videoFrameCapacity = 24
-            videoFrameOverflowPolicy = .dropOldest
+            videoFrameOverflowPolicy = .blockProducer
         } else {
             videoCapacity = hasAudio ? 240 : 600
             videoOverflowPolicy = .blockProducer
-            videoFrameCapacity = hasAudio ? 24 : 36
+            videoFrameCapacity = hasAudio ? 24 : 30
             videoFrameOverflowPolicy = .blockProducer
         }
 
@@ -607,7 +607,9 @@ public actor PlaybackSession: PlayerEngine {
             // for buffering headroom while keeping sync
             preferredLeadSeconds = 0.2
         } else {
-            preferredLeadSeconds = 0.0
+            // For regular VOD, use a small lead to prevent video falling behind
+            // The old 0.0 caused anchor-based pacing which can oscillate
+            preferredLeadSeconds = 0.1
         }
         videoPresentTask = Task { [weak self] in
             guard let self else { return }
@@ -1062,20 +1064,22 @@ private actor VideoPresenter {
         while !Task.isCancelled {
             let frame: DecodedVideoFrame
             if let masterClock = await masterClockProvider(), masterClock.isValid {
+                // Use simple FIFO dequeue for smooth playback instead of popLatestEligible
+                // which can cause stuttering by aggressively skipping frames
+                let snapshot = await frameQueue.snapshot()
                 let lead = max(0.04, preferredLeadSeconds)
                 let maxPTS = masterClock + CMTime(seconds: lead, preferredTimescale: 90_000)
-                let pop = await frameQueue.popLatestEligible(upTo: maxPTS)
-                if pop.droppedCount > 0 {
-                    diagnostics.log("video_present_drop_stale count=\(pop.droppedCount)")
-                }
-                if let eligible = pop.frame {
-                    frame = eligible
+
+                // If we have frames and the oldest is ready, dequeue it
+                if let firstPTS = snapshot.firstPTSSeconds, firstPTS <= maxPTS.seconds {
+                    guard let dequeued = await frameQueue.dequeue() else { break }
+                    frame = dequeued
+                } else if snapshot.count > 0 {
+                    // Frame not yet ready, wait a bit
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                    continue
                 } else {
-                    let snapshot = await frameQueue.snapshot()
-                    if let firstPTS = snapshot.firstPTSSeconds, firstPTS > maxPTS.seconds {
-                        try? await Task.sleep(nanoseconds: 5_000_000)
-                        continue
-                    }
+                    // Queue empty, wait for frame
                     guard let dequeued = await frameQueue.dequeue() else { break }
                     frame = dequeued
                 }
@@ -1089,8 +1093,9 @@ private actor VideoPresenter {
                 let audioClockNow = await masterClockProvider()
                 let framePTS_sec = frame.pts.seconds
                 let audioPTS_sec = audioClockNow?.seconds ?? -1
-                if renderedVideoFrameCount < 5 {
-                    print("[SVP][VideoPresent] framePTS=\(String(format: "%.3f", framePTS_sec)) audioPTS=\(String(format: "%.3f", audioPTS_sec)) lead=\(String(format: "%.3f", framePTS_sec - audioPTS_sec))")
+                let queueSnapshot = await frameQueue.snapshot()
+                if renderedVideoFrameCount < 10 || renderedVideoFrameCount % 60 == 0 {
+                    print("[SVP][VideoPresent] framePTS=\(String(format: "%.3f", framePTS_sec)) audioPTS=\(String(format: "%.3f", audioPTS_sec)) lead=\(String(format: "%.3f", framePTS_sec - audioPTS_sec)) queueCount=\(queueSnapshot.count)")
                 }
                 #endif
                 if await shouldDropLateFrame(frame.pts) {

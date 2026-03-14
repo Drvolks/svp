@@ -93,20 +93,10 @@ public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
         #endif
         lock.unlock()
 
-        if submittedFrameCount == 1 || submittedFrameCount % 60 == 0 {
-            #if DEBUG
-            print(
-                "[SVP][Render] submit count=\(submittedFrameCount) pts=\(String(format: "%.3f", frame.pts.seconds)) " +
-                "submitIntervalMs=\(submitIntervalMs.map { String(format: "%.2f", $0) } ?? "nil") " +
-                "submitDeltaPTS=\(submitDeltaPTS.map { String(format: "%.2f", $0) } ?? "nil")"
-            )
-            #endif
-        }
-
         #if canImport(Metal) && canImport(MetalKit) && canImport(CoreImage)
         if shouldUpdateFPS {
             Task { @MainActor [weak self] in
-                guard let view = self?.boundView else { return }
+                guard let self, let view = self.boundView else { return }
                 view.preferredFramesPerSecond = preferredFPS
                 #if DEBUG
                 print("[SVP][Render] preferred_fps=\(preferredFPS)")

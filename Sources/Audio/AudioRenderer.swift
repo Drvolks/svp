@@ -503,6 +503,8 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             // Use larger buffer duration (46ms) to prevent HAL overload
             // This reduces callback frequency and prevents the "skipping cycle due to overload" errors
             try session.setPreferredIOBufferDuration(0.046)
+            // Don't set preferred sample rate - let the stream determine it (44.1kHz or 48kHz)
+            // Setting a mismatched sample rate causes clock drift
             try session.setActive(true)
             #if DEBUG
             print("[SVP][Audio] session_config sampleRate=\(session.sampleRate) ioBuffer=\(session.ioBufferDuration)")
