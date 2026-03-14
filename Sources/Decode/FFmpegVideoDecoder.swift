@@ -213,6 +213,10 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         let srcYStride = Int(frame.linesizeY)
         let srcUVStride = Int(frame.linesizeUV)
 
+        // Clear the buffer first to avoid "burning" artifacts from stale data
+        memset(dstY, 0, dstYStride * Int(frame.height))
+        memset(dstUV, 0, dstUVStride * Int((frame.height + 1) / 2))
+
         copyPlane(
             source: srcY,
             sourceStride: srcYStride,

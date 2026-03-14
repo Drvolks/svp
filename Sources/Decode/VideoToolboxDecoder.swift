@@ -263,7 +263,7 @@ public actor VideoToolboxDecoder: VideoDecoder {
         }
 
         let pixelBufferAttributes: CFDictionary = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
             kCVPixelBufferMetalCompatibilityKey: true
         ] as CFDictionary
 

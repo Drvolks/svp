@@ -111,57 +111,17 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     }
 
     public func decode(packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
-        if softwareForcedCodecs.contains(packet.formatHint), let fallback {
-            // When using software fallback, route through reorder buffer to ensure
-            // frames are output in PTS order (software decoders may output out of order)
-            if let decoded = try await fallback.decode(packet) {
-                // Add to reorder buffer - it will return frames in order
-                if reorderBuffer[packet.formatHint] == nil {
-                    reorderBuffer[packet.formatHint] = FrameReorderBuffer()
-                }
-                return reorderBuffer[packet.formatHint]!.add(decoded)
-            }
-            return nil
+        // Use only FFmpeg for all codecs to avoid VideoToolbox pixel format issues
+        guard let fallback else {
+            return try await primary.decode(packet)
         }
-        if shouldBypassPrimary(for: packet.formatHint), let fallback {
-            softwareForcedCodecs.insert(packet.formatHint)
-            // Force keyframe resync when initially falling back
-            throw VideoDecodeError.needsKeyframe
+        if let decoded = try await fallback.decode(packet) {
+            if reorderBuffer[packet.formatHint] == nil {
+                reorderBuffer[packet.formatHint] = FrameReorderBuffer()
+            }
+            return reorderBuffer[packet.formatHint]!.add(decoded)
         }
-        do {
-            if let frame = try await primary.decode(packet) {
-                // Success - reset skipped frame count
-                consecutiveSkippedFrameCount[packet.formatHint] = 0
-                return frame
-            }
-            // Decoder returned nil (skipped frame) - track consecutive skips
-            let skipCount = (consecutiveSkippedFrameCount[packet.formatHint] ?? 0) + 1
-            consecutiveSkippedFrameCount[packet.formatHint] = skipCount
-
-            if skipCount >= maxConsecutiveSkippedFramesBeforeFallback {
-                log.debug("[SVP][VideoPipeline] forcing software fallback after \(skipCount) consecutive skipped frames")
-                softwareForcedCodecs.insert(packet.formatHint)
-                // Force keyframe resync - can't decode from mid-GOP
-                throw VideoDecodeError.needsKeyframe
-            }
-            return nil
-        } catch {
-            // Clear skip count on error
-            consecutiveSkippedFrameCount[packet.formatHint] = 0
-
-            if let decodeError = error as? VideoDecodeError {
-                if case .needMoreData = decodeError {
-                    // Primary decoder may need SPS/PPS/VPS before it can output frames.
-                    // This is not a hard failure and should not force fallback.
-                    return nil
-                }
-            }
-            guard let fallback else { throw error }
-            if shouldForceSoftwareFallback(for: error) {
-                softwareForcedCodecs.insert(packet.formatHint)
-            }
-            return try await fallback.decode(packet)
-        }
+        return nil
     }
 
     public func flush() async {

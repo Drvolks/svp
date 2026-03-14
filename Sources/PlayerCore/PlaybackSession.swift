@@ -603,14 +603,10 @@ public actor PlaybackSession: PlayerEngine {
         let useLivePresentation = sourceDescriptor?.isLive == true
         if sourceDescriptor?.isLive == true {
             preferredLeadSeconds = 0.08
-        } else if isSplitSourceDescriptor(sourceDescriptor) {
-            // Moderate lead for split AV - allows video to run slightly ahead of audio
-            // for buffering headroom while keeping sync
-            preferredLeadSeconds = 0.2
         } else {
-            // For regular VOD, use a small lead to prevent video falling behind
-            // The old 0.0 caused anchor-based pacing which can oscillate
-            preferredLeadSeconds = 0.1
+            // For VOD (including YouTube), use larger lead to slow down playback
+            // Software decode is slower, so give more buffer to match real-time
+            preferredLeadSeconds = 0.8
         }
         videoPresentTask = Task { [weak self] in
             guard let self else { return }
@@ -799,11 +795,17 @@ public actor PlaybackSession: PlayerEngine {
             return false
         }
         let lagSeconds = (audioPTS - framePTS).seconds
+        let shouldDrop: Bool
         if sourceDescriptor?.isLive == true {
-            return lagSeconds > 0.200
+            shouldDrop = lagSeconds > 0.200
+        } else {
+            // For VOD, allow some lag but don't let frame backlog grow indefinitely.
+            shouldDrop = lagSeconds > 0.300
         }
-        // For VOD, allow some lag but don't let frame backlog grow indefinitely.
-        return lagSeconds > 0.300
+        if shouldDrop {
+            log.debug("[SVP] shouldDropLateVideoFrame: framePTS=\(framePTS.seconds) audioPTS=\(audioPTS.seconds) lag=\(lagSeconds) -> DROP")
+        }
+        return shouldDrop
     }
 
     private func currentAudioClockForPresentation(allowDecodeFallback: Bool = true) -> CMTime? {
@@ -1062,16 +1064,16 @@ private actor VideoPresenter {
                 let lead = max(0.04, preferredLeadSeconds)
                 let maxPTS = masterClock + CMTime(seconds: lead, preferredTimescale: 90_000)
 
-                // If we have frames and the oldest is ready, dequeue it
-                if let firstPTS = snapshot.firstPTSSeconds, firstPTS <= maxPTS.seconds {
+                // If we have frames, always try to dequeue
+                // Don't wait when video is ahead - just display frames as they come
+                // The wait only makes sense when video is behind and needs to catch up
+                let firstPTS = snapshot.firstPTSSeconds
+                if snapshot.count > 0 {
                     guard let dequeued = await frameQueue.dequeue() else { break }
                     frame = dequeued
-                } else if snapshot.count > 0 {
-                    // Frame not yet ready, wait a bit
-                    try? await Task.sleep(nanoseconds: 5_000_000)
-                    continue
                 } else {
                     // Queue empty, wait for frame
+                    log.debug("[SVP] VideoPresent queue empty, waiting...")
                     guard let dequeued = await frameQueue.dequeue() else { break }
                     frame = dequeued
                 }
@@ -1252,15 +1254,17 @@ private actor VideoPresenter {
                 guard let masterClock = await masterClockProvider(), masterClock.isValid else {
                     // Audio clock not available yet - skip pacing and render immediately
                     // This prevents deadlock when audio hasn't started playing (pre-buffer period)
+                    log.debug("[SVP] pace: no masterClock, rendering immediately")
                     break
                 }
                 let lead = framePTS.seconds - masterClock.seconds
                 let sleepSeconds = lead - targetLead
+                log.debug("[SVP] pace: framePTS=\(framePTS.seconds) masterClock=\(masterClock.seconds) lead=\(lead) targetLead=\(targetLead) sleepSeconds=\(sleepSeconds)")
                 if sleepSeconds <= 0.01 {
                     break
                 }
-                let boundedSleep = min(0.02, sleepSeconds)
-                try await Task.sleep(nanoseconds: UInt64(boundedSleep * 1_000_000_000))
+                // Sleep the full amount needed to reach target lead
+                try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))   
             }
             lastRenderedVideoPTS = framePTS
             lastRenderedVideoUptime = ProcessInfo.processInfo.systemUptime
