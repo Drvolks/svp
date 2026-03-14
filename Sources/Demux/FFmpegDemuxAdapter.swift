@@ -1,6 +1,7 @@
 import CoreMedia
 import FFmpegBridge
 import Foundation
+import OSLog
 import PlayerCore
 
 public enum FFmpegDemuxError: Error, Sendable {
@@ -17,7 +18,7 @@ extension FFmpegDemuxError: PlaybackCategorizedError {
 }
 
 public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
-    private static let buildStamp = "SVP_LOCAL_2026-03-13T19:45"
+    private static let buildStamp = "SVP_LOCAL_2026-03-13T19:50"
     private static let reorderBufferSize = 8
     private let url: URL?
     private let videoURL: URL?
@@ -30,6 +31,8 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
     private var packetStreamGeneration: UInt64 = 0
     // Reordering buffer to handle out-of-order packets from FFmpeg
     private var reorderBuffer: [DemuxedPacket] = []
+
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "Demux")
 
     public init(url: URL) {
         self.url = url
@@ -450,9 +453,7 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
     }
 
     private func log(_ message: String) {
-        #if DEBUG
-        print("[SVP][Demux] \(message)")
-        #endif
+        log.debug("[SVP][Demux] \(message)")
     }
 }
 

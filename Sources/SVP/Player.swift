@@ -3,11 +3,13 @@ import CoreMedia
 import Decode
 import Demux
 import Input
+import OSLog
 import PlayerCore
 import Render
 
 public actor Player: PlayerEngine {
     private let session: PlaybackSession
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "Player")
     private let defaultAudioRenderer: AudioRenderer
     private let sourceKindOverrideForLoad: SourceKind?
 
@@ -33,25 +35,17 @@ public actor Player: PlayerEngine {
             : nil
         let demux: any DemuxEngine
 
-        #if DEBUG
-        print("[SVP][Player] init dual: videoKind=\(videoKind) audioKind=\(audioKind) sameUnderlying=\(coalescedKind != nil)")
-        #endif
+        log.debug("[SVP][Player] init dual: videoKind=\(String(describing: videoKind)) audioKind=\(String(describing: audioKind)) sameUnderlying=\(coalescedKind != nil)")
 
         if coalescedKind != nil {
-            #if DEBUG
-            print("[SVP][Player] using single demux (same underlying)")
-            #endif
+            log.debug("[SVP][Player] using single demux (same underlying)")
             demux = Self.makeDemuxEngine(for: videoSource)
         } else if let videoURL = Self.extractURL(from: videoKind),
                   let audioURL = Self.extractURL(from: audioKind) {
-            #if DEBUG
-            print("[SVP][Player] using unified FFmpegDemuxAdapter: video=\(videoURL) audio=\(audioURL)")
-            #endif
+            log.debug("[SVP][Player] using unified FFmpegDemuxAdapter: video=\(videoURL) audio=\(audioURL)")
             demux = FFmpegDemuxAdapter(videoURL: videoURL, audioURL: audioURL)
         } else {
-            #if DEBUG
-            print("[SVP][Player] using SplitAVInputSource path")
-            #endif
+            log.debug("[SVP][Player] using SplitAVInputSource path")
             let compositeSource = SplitAVInputSource(videoSource: videoSource, audioSource: audioSource)
             demux = Self.makeDemuxEngine(for: compositeSource)
         }

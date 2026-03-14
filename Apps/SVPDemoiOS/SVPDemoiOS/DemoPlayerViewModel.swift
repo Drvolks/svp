@@ -2,6 +2,7 @@ import AVFoundation
 import AVKit
 import CoreMedia
 import Input
+import OSLog
 import PiP
 import PlayerCore
 import Render
@@ -10,6 +11,7 @@ import SwiftUI
 
 @MainActor
 final class DemoPlayerViewModel: NSObject, ObservableObject {
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "DemoPlayer")
     enum FullscreenRendererMode: String, CaseIterable, Identifiable {
         case metal = "Metal"
         case sampleBuffer = "Layer"
@@ -68,15 +70,11 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
             do {
                 try session.setCategory(attempt.0, mode: attempt.1, options: attempt.2)
                 try session.setActive(true)
-                #if DEBUG
-                print("[SVP][Audio] audio_session active=true attempt=\(index + 1) mode=\(attempt.1.rawValue)")
-                #endif
+                log.debug("[SVP][Audio] audio_session active=true attempt=\(index + 1) mode=\(attempt.1.rawValue)")
                 return
             } catch {
-                #if DEBUG
                 let nsError = error as NSError
-                print("[SVP][Audio] audio_session attempt=\(index + 1) failed code=\(nsError.code) desc=\(error.localizedDescription)")
-                #endif
+                log.debug("[SVP][Audio] audio_session attempt=\(index + 1) failed code=\(nsError.code) desc=\(error.localizedDescription)")
             }
         }
     }
@@ -338,9 +336,7 @@ final class DemoPlayerViewModel: NSObject, ObservableObject {
     }
 
     private func logPiP(_ message: String) {
-        #if DEBUG
-        print("[SVP][PiP] \(message)")
-        #endif
+        log.debug("[SVP][PiP] \(message)")
     }
 
     private func refreshPiPPossible() {

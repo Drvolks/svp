@@ -1,5 +1,6 @@
 import CoreMedia
 import Foundation
+import OSLog
 import PlayerCore
 
 #if canImport(Metal) && canImport(MetalKit) && canImport(CoreImage)
@@ -23,6 +24,8 @@ public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
     private var latestSubmittedPTS: CMTime = .zero
     private var lastSubmitUptime: TimeInterval?
     private var lastSubmitPTSForLog: CMTime?
+
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "Render")
 
     #if canImport(Metal) && canImport(MetalKit) && canImport(CoreImage)
     private let device: MTLDevice?
@@ -98,9 +101,7 @@ public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
             Task { @MainActor [weak self] in
                 guard let self, let view = self.boundView else { return }
                 view.preferredFramesPerSecond = preferredFPS
-                #if DEBUG
-                print("[SVP][Render] preferred_fps=\(preferredFPS)")
-                #endif
+                log.debug("[SVP][Render] preferred_fps=\(preferredFPS)")
             }
         }
         #endif
@@ -127,9 +128,7 @@ public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
             Task { @MainActor [weak self] in
                 guard let view = self?.boundView else { return }
                 view.preferredFramesPerSecond = fps
-                #if DEBUG
-                print("[SVP][Render] preferred_fps=\(fps) fixed=true")
-                #endif
+                self?.log.debug("[SVP][Render] preferred_fps=\(fps) fixed=true")
             }
         }
         #endif
@@ -249,13 +248,7 @@ extension MetalRenderer: MTKViewDelegate {
         if drawnFrameCount == 1 || drawnFrameCount % 60 == 0 {
             let elapsedMs = (ProcessInfo.processInfo.systemUptime - start) * 1000
             let staleBy = latestSubmittedPTS.isValid && framePTS.isValid ? max(0, latestSubmittedPTS.seconds - framePTS.seconds) : 0
-            #if DEBUG
-            print(
-                "[SVP][Render] draw count=\(drawnFrameCount) pts=\(String(format: "%.3f", framePTS.seconds)) " +
-                "ms=\(String(format: "%.2f", elapsedMs)) drawable=\(drawable.texture.width)x\(drawable.texture.height) " +
-                "latestSubmitCount=\(latestSubmittedCount) latestSubmitPTS=\(String(format: "%.3f", latestSubmittedPTS.seconds)) staleBy=\(String(format: "%.3f", staleBy))"
-            )
-            #endif
+            log.debug("[SVP][Render] draw count=\(drawnFrameCount) pts=\(framePTS.seconds, format: .fixed(precision: 3)) ms=\(elapsedMs, format: .fixed(precision: 2)) drawable=\(drawable.texture.width)x\(drawable.texture.height) latestSubmitCount=\(latestSubmittedCount) latestSubmitPTS=\(latestSubmittedPTS.seconds, format: .fixed(precision: 3)) staleBy=\(staleBy, format: .fixed(precision: 3))")
         }
     }
 

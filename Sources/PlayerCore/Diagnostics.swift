@@ -71,9 +71,6 @@ public final class PlaybackDiagnostics: @unchecked Sendable {
     public func log(_ message: String) {
         #if canImport(OSLog)
         logger.debug("\(message, privacy: .public)")
-        #if DEBUG
-        print("[SVP] \(message)")
-        #endif
         #else
         print("[SVP] \(message)")
         #endif

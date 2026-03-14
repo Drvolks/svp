@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import PlayerCore
 
 #if canImport(AVFoundation)
@@ -63,6 +64,8 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     private var notificationTokens: [NSObjectProtocol] = []
     #endif
 
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "Audio")
+
     public init() {
         minStartBufferSeconds = profile.baseStartBufferSeconds
         #if canImport(AVFoundation)
@@ -81,34 +84,33 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
     }
 
     public func render(frame: DecodedAudioFrame) {
-        _ = lock.withLock {
+        let ptsSeconds = frame.pts.seconds
+        let sampleRate = frame.sampleRate
+        let channels = frame.channels
+        let byteCount = frame.data.count
+
+        let shouldLogFirstRender = lock.withLock {
             renderedFrames += 1
             if !loggedFirstRender {
                 loggedFirstRender = true
-                #if DEBUG
-                print("[SVP][Audio] first_render pts=\(frame.pts.seconds) sampleRate=\(frame.sampleRate) channels=\(frame.channels) bytes=\(frame.data.count)")
-                print("[SVP][Audio] jitter_buffer mode=\(profile.mode) start=\(minStartBufferSeconds)s base=\(profile.baseStartBufferSeconds)s max=\(profile.maxStartBufferSeconds)s lowWater=\(profile.rebufferLowWaterSeconds)s lowHits=\(profile.lowWaterHitsBeforeRebuffer)s maxBuffered=\(profile.maxBufferedAudioSeconds)s callback=dataPlayedBack")
-                #endif
+                return true
             }
+            return false
         }
-
+        
         #if canImport(AVFoundation)
         do {
             try configureIfNeeded(for: frame)
             guard let format = configuredFormat else { return }
             guard let pcmBuffer = makePCMBuffer(frame: frame, format: format) else {
                 lock.withLock { droppedFrames += 1 }
-                #if DEBUG
-                print("[SVP][Audio] drop_frame reason=pcm_buffer")
-                #endif
+                log.debug("[SVP][Audio] drop_frame reason=pcm_buffer")
                 return
             }
 
             if !engine.isRunning {
                 try engine.start()
-                #if DEBUG
-                print("[SVP][Audio] engine_started_in_render")
-                #endif
+                log.debug("[SVP][Audio] engine_started_in_render")
             }
             let bufferSeconds = Double(pcmBuffer.frameLength) / format.sampleRate
             let queuedAfterAppend = lock.withLock { () -> Double in
@@ -117,9 +119,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                     playbackAnchorPTS = frame.pts
                     playbackAnchorSampleRate = format.sampleRate
                     playbackAnchorSampleTime = nil
-                    #if DEBUG
-                    print("[SVP][Audio] audioClockAnchor pts=\(frame.pts.seconds) sampleRate=\(format.sampleRate)")
-                    #endif
+                    log.debug("[SVP][Audio] audioClockAnchor pts=\(frame.pts.seconds) sampleRate=\(format.sampleRate)")
                 }
                 return queuedBufferSeconds
             }
@@ -132,19 +132,15 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                     hasStartedPlayerNode = true
                     isRebuffering = false
                 }
-                #if DEBUG
                 let state = lock.withLock { (wantsPlayback, queuedBufferSeconds, minStartBufferSeconds) }
-                print("[SVP][Audio] playerNode_start_now wants=\(state.0) queued=\(String(format: "%.3f", state.1)) target=\(String(format: "%.3f", state.2))")
-                #endif
+                log.debug("[SVP][Audio] playerNode_start_now wants=\(state.0) queued=\(String(format: "%.3f", state.1)) target=\(String(format: "%.3f", state.2))")
             }
             if queuedAfterAppend > profile.maxBufferedAudioSeconds {
-                lock.withLock {
+                lock.withLock { [self] in
                     queuedBufferSeconds = max(0, queuedBufferSeconds - bufferSeconds)
                     droppedFrames += 1
                 }
-                #if DEBUG
-                print("[SVP][Audio] drop_frame reason=queue_overflow queued=\(queuedAfterAppend) max=\(profile.maxBufferedAudioSeconds)")
-                #endif
+                log.debug("[SVP][Audio] drop_frame reason=queue_overflow queued=\(queuedAfterAppend) max=\(self.profile.maxBufferedAudioSeconds)")
                 return
             }
             playerNode.scheduleBuffer(pcmBuffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
@@ -159,16 +155,12 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             lock.withLock {
                 scheduledFrames += 1
                 if scheduledFrames == 1 {
-                    #if DEBUG
-                    print("[SVP][Audio] first_schedule frameLength=\(pcmBuffer.frameLength)")
-                    #endif
+                    log.debug("[SVP][Audio] first_schedule frameLength=\(pcmBuffer.frameLength)")
                 }
             }
         } catch {
             lock.withLock { droppedFrames += 1 }
-            #if DEBUG
-            print("[SVP][Audio] render_error \(error.localizedDescription)")
-            #endif
+            log.debug("[SVP][Audio] render_error \(error.localizedDescription)")
             return
         }
         #endif
@@ -185,24 +177,18 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             wantsPlayback = true
             isRebuffering = true
         }
-        #if DEBUG
-        print("[SVP][Audio] handlePlay")
-        #endif
+        log.debug("[SVP][Audio] handlePlay")
         #if canImport(AVFoundation)
         do {
             // Engine must have a valid connected format before starting.
             guard configuredFormat != nil else { return }
             if !engine.isRunning {
                 try engine.start()
-                #if DEBUG
-                print("[SVP][Audio] engine_started_in_handlePlay")
-                #endif
+                log.debug("[SVP][Audio] engine_started_in_handlePlay")
             }
             maybeStartPlaybackIfReady(logContext: "handlePlay")
         } catch {
-            #if DEBUG
-            print("[SVP][Audio] handlePlay_error \(error.localizedDescription)")
-            #endif
+            log.debug("[SVP][Audio] handlePlay_error \(error.localizedDescription)")
             return
         }
         #endif
@@ -215,9 +201,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             hasStartedPlayerNode = false
             queuedBufferSeconds = 0
         }
-        #if DEBUG
-        print("[SVP][Audio] handlePause")
-        #endif
+        log.debug("[SVP][Audio] handlePause")
         #if canImport(AVFoundation)
         playerNode.pause()
         #endif
@@ -272,7 +256,6 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             }
             return lastDerivedPlaybackPTS ?? playedTime
         }
-        #if DEBUG
         let queryCount = state.3
         if queryCount == 1 || queryCount % 60 == 0 {
             let anchorText = String(format: "%.3f", anchorPTS.seconds)
@@ -280,15 +263,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             let derivedText = String(format: "%.3f", playbackTime.seconds)
             let queuedText = String(format: "%.3f", state.2)
             let anchorSampleText = String(lock.withLock { playbackAnchorSampleTime ?? 0 })
-            print(
-                "[SVP][AudioClock] query=\(queryCount) " +
-                "anchorPTS=\(anchorText) " +
-                "sampleTime=\(playerTime.sampleTime) anchorSampleTime=\(anchorSampleText) sampleRate=\(sampleRateText) " +
-                "derivedPTS=\(derivedText) " +
-                "queued=\(queuedText)"
-            )
+            let msg = "[SVP][AudioClock] query=\(queryCount) anchorPTS=\(anchorText) sampleTime=\(playerTime.sampleTime) anchorSampleTime=\(anchorSampleText) sampleRate=\(sampleRateText) derivedPTS=\(derivedText) queued=\(queuedText)"
+            log.debug("\(msg)")
         }
-        #endif
         return playbackTime.isValid ? playbackTime : nil
         #else
         return nil
@@ -303,15 +280,10 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             minStartBufferSeconds = nextProfile.baseStartBufferSeconds
             return changed
         }
-        #if DEBUG
         if changed {
-            print(
-                "[SVP][Audio] profile mode=\(nextProfile.mode) " +
-                "base=\(nextProfile.baseStartBufferSeconds) max=\(nextProfile.maxStartBufferSeconds) " +
-                "lowWater=\(nextProfile.rebufferLowWaterSeconds) maxBuffered=\(nextProfile.maxBufferedAudioSeconds)"
-            )
+            let msg = "[SVP][Audio] profile mode=\(nextProfile.mode) base=\(nextProfile.baseStartBufferSeconds) max=\(nextProfile.maxStartBufferSeconds) lowWater=\(nextProfile.rebufferLowWaterSeconds) maxBuffered=\(nextProfile.maxBufferedAudioSeconds)"
+            log.debug("\(msg)")
         }
-        #endif
     }
 
 
@@ -442,18 +414,14 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 hasStartedPlayerNode = true
                 isRebuffering = false
             }
-            #if DEBUG
-            print("[SVP][Audio] playerNode_resume_in_\(logContext) queued=\(queuedSeconds)")
-            #endif
+            log.debug("[SVP][Audio] playerNode_resume_in_\(logContext) queued=\(queuedSeconds)")
             return
         }
 
         guard queuedSeconds >= requiredBufferSeconds else {
-            #if DEBUG
             if queuedSeconds > 0 {
-                print("[SVP][Audio] start_wait_in_\(logContext) queued=\(queuedSeconds) target=\(requiredBufferSeconds)")
+                log.debug("[SVP][Audio] start_wait_in_\(logContext) queued=\(queuedSeconds) target=\(requiredBufferSeconds)")
             }
-            #endif
             return
         }
         if !playerNode.isPlaying {
@@ -462,10 +430,8 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
                 hasStartedPlayerNode = true
                 isRebuffering = false
             }
-            #if DEBUG
             let reason = rebuffering ? "rebuffer" : "start"
-            print("[SVP][Audio] playerNode_play_in_\(logContext) queued=\(queuedSeconds) target=\(requiredBufferSeconds) reason=\(reason)")
-            #endif
+            log.debug("[SVP][Audio] playerNode_play_in_\(logContext) queued=\(queuedSeconds) target=\(requiredBufferSeconds) reason=\(reason)")
         }
     }
 
@@ -490,9 +456,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             lowWaterHitCount = 0
             return (underrunCount, minStartBufferSeconds)
         }
-        #if DEBUG
-        print("[SVP][Audio] underrun_enter count=\(state.0) queued=\(queuedSeconds) lowHits=\(lowWaterState.0) nextTarget=\(state.1)")
-        #endif
+        log.debug("[SVP][Audio] underrun_enter count=\(state.0) queued=\(queuedSeconds) lowHits=\(lowWaterState.0) nextTarget=\(state.1)")
     }
 
     #if canImport(UIKit)
@@ -506,13 +470,9 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             // Don't set preferred sample rate - let the stream determine it (44.1kHz or 48kHz)
             // Setting a mismatched sample rate causes clock drift
             try session.setActive(true)
-            #if DEBUG
-            print("[SVP][Audio] session_config sampleRate=\(session.sampleRate) ioBuffer=\(session.ioBufferDuration)")
-            #endif
+            log.debug("[SVP][Audio] session_config sampleRate=\(session.sampleRate) ioBuffer=\(session.ioBufferDuration)")
         } catch {
-            #if DEBUG
-            print("[SVP][Audio] session_config_failed \(error.localizedDescription)")
-            #endif
+            log.debug("[SVP][Audio] session_config_failed \(error.localizedDescription)")
             return
         }
     }

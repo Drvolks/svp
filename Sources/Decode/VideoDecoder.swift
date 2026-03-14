@@ -1,5 +1,6 @@
 import CoreMedia
 import Foundation
+import OSLog
 import PlayerCore
 
 public protocol VideoDecoder: Sendable {
@@ -31,14 +32,14 @@ private struct FrameReorderBuffer {
     private var frames: [DecodedVideoFrame] = []
     private let maxSize: Int
 
+    private static let log = Logger(subsystem: "com.drvolks.svp", category: "Reorder")
+
     init(maxSize: Int = 8) {
         self.maxSize = maxSize
     }
 
     mutating func add(_ frame: DecodedVideoFrame) -> DecodedVideoFrame? {
-        #if DEBUG
         let beforeCount = frames.count
-        #endif
         frames.append(frame)
         frames.sort { $0.pts.seconds < $1.pts.seconds }
 
@@ -49,9 +50,15 @@ private struct FrameReorderBuffer {
             releasedFrame = frames.removeFirst()
         }
 
-        #if DEBUG
-        print("[SVP][Reorder] add pts=\(String(format: "%.3f", frame.pts.seconds)) before=\(beforeCount) after=\(frames.count) released=\(releasedFrame != nil ? String(format: "%.3f", releasedFrame!.pts.seconds) : "nil")")
-        #endif
+        let releasedPTS: String
+        if let rf = releasedFrame {
+            releasedPTS = String(format: "%.3f", rf.pts.seconds)
+        } else {
+            releasedPTS = "nil"
+        }
+        let afterCount = frames.count
+        let msg = "[SVP][Reorder] add pts=\(String(format: "%.3f", frame.pts.seconds)) before=\(beforeCount) after=\(afterCount) released=\(releasedPTS)"
+        Self.log.debug("\(msg)")
 
         return releasedFrame
     }
@@ -83,6 +90,8 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     private var consecutiveSkippedFrameCount: [CodecID: Int] = [:]
     private let maxConsecutiveSkippedFramesBeforeFallback = 5
     private var reorderBuffer: [CodecID: FrameReorderBuffer] = [:]
+
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "VideoPipeline")
 
     public init(preferHardware: Bool = true) {
         self.preferHardware = preferHardware
@@ -130,9 +139,7 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
             consecutiveSkippedFrameCount[packet.formatHint] = skipCount
 
             if skipCount >= maxConsecutiveSkippedFramesBeforeFallback {
-                #if DEBUG
-                print("[SVP][VideoPipeline] forcing software fallback after \(skipCount) consecutive skipped frames")
-                #endif
+                log.debug("[SVP][VideoPipeline] forcing software fallback after \(skipCount) consecutive skipped frames")
                 softwareForcedCodecs.insert(packet.formatHint)
                 // Force keyframe resync - can't decode from mid-GOP
                 throw VideoDecodeError.needsKeyframe
@@ -173,7 +180,6 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
         guard preferHardware else { return false }
         switch codec {
         case .av1, .vp9:
-            // Use software decode for these codecs (hardware may not support them on all devices)
             return true
         default:
             return false
@@ -190,3 +196,4 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
         }
     }
 }
+

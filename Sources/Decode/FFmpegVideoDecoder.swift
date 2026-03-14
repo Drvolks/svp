@@ -2,6 +2,7 @@ import CoreMedia
 import CoreVideo
 import FFmpegBridge
 import Foundation
+import OSLog
 import PlayerCore
 
 public actor FFmpegVideoDecoder: VideoDecoder {
@@ -10,6 +11,8 @@ public actor FFmpegVideoDecoder: VideoDecoder {
     private var activeCodecConfig: Data?
     private var droppedInvalidPacketCount = 0
     private var consecutiveInvalidPacketDrops = 0
+
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "FFmpegDecode")
 
     public init() {}
 
@@ -75,11 +78,9 @@ public actor FFmpegVideoDecoder: VideoDecoder {
             if shouldIgnoreDecodeError(status) {
                 droppedInvalidPacketCount += 1
                 consecutiveInvalidPacketDrops += 1
-                #if DEBUG
                 if droppedInvalidPacketCount == 1 || droppedInvalidPacketCount % 25 == 0 {
-                    print("[SVP][Decode] drop_invalid_packet codec=\(packet.formatHint) status=\(status) count=\(droppedInvalidPacketCount)")
+                    log.debug("[SVP][Decode] drop_invalid_packet codec=\(String(describing: packet.formatHint)) status=\(status) count=\(self.droppedInvalidPacketCount)")
                 }
-                #endif
                 if consecutiveInvalidPacketDrops >= 8 {
                     // Persistent invalid packets usually indicate we started mid-GOP
                     // or decoder state drifted. Escalate so PlaybackSession can

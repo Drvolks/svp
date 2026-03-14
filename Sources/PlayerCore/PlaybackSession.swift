@@ -1,5 +1,6 @@
 import CoreMedia
 import Foundation
+import OSLog
 
 public protocol DemuxEngine: Actor {
     func makePacketStream() -> AsyncThrowingStream<DemuxedPacket, Error>
@@ -56,6 +57,8 @@ public actor PlaybackSession: PlayerEngine {
     private var waitingForVideoKeyframeResync = false
     private var loggedFirstVideoFrame = false
     private var loggedFirstAudioFrame = false
+
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "PlaybackSession")
     private var lastRenderedAudioPTS: CMTime?
     private var lastRenderedAudioUptime: TimeInterval?
     private var audioTimelineAnchorPTS: CMTime?
@@ -264,9 +267,7 @@ public actor PlaybackSession: PlayerEngine {
                 }
                 switch packet.formatHint {
                 case .h264, .hevc, .av1, .vp9:
-                    #if DEBUG
-                    print("[SVP] video_packet_enqueue pts=\(String(describing: packet.pts))")
-                    #endif
+                    log.debug("[SVP] video_packet_enqueue pts=\(String(describing: packet.pts))")
                     if !(await videoPacketQueue.enqueue(packet)) {
                         droppedVideoPackets += 1
                         if droppedVideoPackets == 1 || droppedVideoPackets % 30 == 0 {
@@ -674,13 +675,9 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func decodeVideoPackets(generation: UInt64) async {
-        #if DEBUG
-        print("[SVP] video_decode_loop starting")
-        #endif
+        log.debug("[SVP] video_decode_loop starting")
         while let packet = await videoPacketQueue.dequeue() {
-            #if DEBUG
-            print("[SVP] video_decode_loop dequeue pts=\(String(describing: packet.pts))")
-            #endif
+            log.debug("[SVP] video_decode_loop dequeue pts=\(String(describing: packet.pts))")
             if Task.isCancelled || !isGenerationCurrent(generation) { return }
             if waitingForVideoKeyframeResync {
                 guard packet.isKeyframe else { continue }
@@ -699,9 +696,7 @@ public actor PlaybackSession: PlayerEngine {
             do {
                 let decodeStart = ProcessInfo.processInfo.systemUptime
                 if let frame = try await videoPipeline.decode(packet: packet) {
-                    #if DEBUG
-                    print("[SVP] video_decode returned frame pts=\(String(describing: frame.pts))")
-                    #endif
+                    log.debug("[SVP] video_decode returned frame pts=\(String(describing: frame.pts))")
                     let decodeElapsedMs = (ProcessInfo.processInfo.systemUptime - decodeStart) * 1000
                     guard frame.pixelBuffer != nil else {
                         throw PlaybackSessionError.renderOutputMissing
@@ -718,18 +713,14 @@ public actor PlaybackSession: PlayerEngine {
                     lastDecodedVideoFramePTS = frame.pts
                     lastDecodedVideoFrameUptime = ProcessInfo.processInfo.systemUptime
                     lastVideoDecodeElapsedMs = decodeElapsedMs
-                    #if DEBUG
-                    print("[SVP][VideoDecode] enqueue pts=\(String(format: "%.3f", frame.pts.seconds))")
-                    #endif
+                    log.debug("[SVP][VideoDecode] enqueue pts=\(String(format: "%.3f", frame.pts.seconds))")
                     if !(await videoFrameQueue.enqueue(instrumentedFrame)) {
                         return
                     }
                     consecutiveVideoDecodeFailures = 0
                 }
             } catch {
-                #if DEBUG
-                print("[SVP] video_decode_error error=\(error)")
-                #endif
+                log.debug("[SVP] video_decode_error error=\(error)")
                 if Task.isCancelled { return }
                 consecutiveVideoDecodeFailures += 1
                 diagnostics.incrementDecodeFailure()
@@ -995,6 +986,7 @@ private struct AudioSynchronizerAdapter: Sendable {
 }
 
 private actor VideoPresenter {
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "VideoPresenter")
     private let diagnostics: PlaybackDiagnostics
     private var outputs: [ObjectIdentifier: any VideoOutput] = [:]
     private var loggedFirstVideoFrame = false
@@ -1089,15 +1081,13 @@ private actor VideoPresenter {
             }
             if Task.isCancelled { return }
             do {
-                #if DEBUG
                 let audioClockNow = await masterClockProvider()
                 let framePTS_sec = frame.pts.seconds
                 let audioPTS_sec = audioClockNow?.seconds ?? -1
                 let queueSnapshot = await frameQueue.snapshot()
                 if renderedVideoFrameCount < 10 || renderedVideoFrameCount % 60 == 0 {
-                    print("[SVP][VideoPresent] framePTS=\(String(format: "%.3f", framePTS_sec)) audioPTS=\(String(format: "%.3f", audioPTS_sec)) lead=\(String(format: "%.3f", framePTS_sec - audioPTS_sec)) queueCount=\(queueSnapshot.count)")
+                    log.debug("[SVP][VideoPresent] framePTS=\(String(format: "%.3f", framePTS_sec)) audioPTS=\(String(format: "%.3f", audioPTS_sec)) lead=\(String(format: "%.3f", framePTS_sec - audioPTS_sec)) queueCount=\(queueSnapshot.count)")
                 }
-                #endif
                 if await shouldDropLateFrame(frame.pts) {
                     continue
                 }

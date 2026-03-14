@@ -1,6 +1,7 @@
 import CoreMedia
 import Foundation
 import Input
+import OSLog
 import PlayerCore
 
 public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
@@ -9,6 +10,8 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
     private let videoStreamIDOffset = 1_000
     private let audioStreamIDOffset = 2_000
     private var mergeGeneration: UInt64 = 0
+
+    private let log = Logger(subsystem: "com.drvolks.svp", category: "SplitDemux")
 
     public init(videoDemuxer: any DemuxEngine, audioDemuxer: any DemuxEngine) {
         self.videoDemuxer = videoDemuxer
@@ -31,12 +34,6 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                 var lastAudioNormalizedPTS: Int64?
                 var forwardedVideoPackets = 0
                 var forwardedAudioPackets = 0
-
-                func log(_ message: String) {
-                    #if DEBUG
-                    print("[SVP][SplitDemux] \(message)")
-                    #endif
-                }
 
                 func logFirstPTS() {
                     // Logging disabled - baseline is logged in establishCommonBaseline
@@ -62,7 +59,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     // Use the minimum as baseline (earliest packet in timeline)
                     commonBaseline = min(videoPTS, audioPTS)
                     let b_sec = Double(commonBaseline!) / 90000.0
-                    log("baseline=\(String(format: "%.3f", b_sec)) video=\(Double(videoPTS)/90000.0) audio=\(Double(audioPTS)/90000.0)")
+                    log.debug("[SVP][SplitDemux] baseline=\(String(format: "%.3f", b_sec)) video=\(Double(videoPTS)/90000.0) audio=\(Double(audioPTS)/90000.0)")
                 }
 
                 func isVideoPacket(_ packet: DemuxedPacket) -> Bool {
@@ -88,11 +85,9 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     let baseline = commonBaseline ?? packet.pts ?? packet.dts ?? 0
                     let normalizedPTS = packet.pts.map { max(0, $0 - baseline) }
                     let normalizedDTS = packet.dts.map { max(0, $0 - baseline) }
-                    #if DEBUG
                     if forwardedVideoPackets == 1 || forwardedAudioPackets == 1 {
-                        log("normalize origPts=\(String(describing: packet.pts)) normalized=\(String(describing: normalizedPTS)) baseline=\(baseline)")
+                        log.debug("[SVP][SplitDemux] normalize origPts=\(String(describing: packet.pts)) normalized=\(String(describing: normalizedPTS)) baseline=\(baseline)")
                     }
-                    #endif
                     return DemuxedPacket(
                         streamID: StreamID(packet.streamID.rawValue + streamIDOffset),
                         pts: normalizedPTS,
@@ -166,7 +161,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         }
                         guard let packet = try await iterator.next() else {
                             if await self.isMergeGenerationCurrent(generation) {
-                                log("video_eof forwarded=\(forwardedVideoPackets)")
+                                log.debug("[SVP][SplitDemux] video_eof forwarded=\(forwardedVideoPackets)")
                             }
                             return nil
                         }
@@ -180,7 +175,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         )
                         forwardedVideoPackets += 1
                         if forwardedVideoPackets == 1 || forwardedVideoPackets % 300 == 0 {
-                            log("video_forward count=\(forwardedVideoPackets) pts=\(String(describing: normalized.pts))")
+                            log.debug("[SVP][SplitDemux] video_forward count=\(forwardedVideoPackets) pts=\(String(describing: normalized.pts))")
                         }
                         if forwardedVideoPackets == 1 {
                             logFirstPTS()
@@ -198,7 +193,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         }
                         guard let packet = try await iterator.next() else {
                             if await self.isMergeGenerationCurrent(generation) {
-                                log("audio_eof forwarded=\(forwardedAudioPackets)")
+                                log.debug("[SVP][SplitDemux] audio_eof forwarded=\(forwardedAudioPackets)")
                             }
                             return nil
                         }
@@ -212,7 +207,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                         )
                         forwardedAudioPackets += 1
                         if forwardedAudioPackets == 1 || forwardedAudioPackets % 300 == 0 {
-                            log("audio_forward count=\(forwardedAudioPackets) pts=\(String(describing: normalized.pts))")
+                            log.debug("[SVP][SplitDemux] audio_forward count=\(forwardedAudioPackets) pts=\(String(describing: normalized.pts))")
                         }
                         if forwardedAudioPackets == 1 {
                             logFirstPTS()
@@ -261,7 +256,7 @@ public actor SplitAVDemuxEngine: PlayerCore.DemuxEngine {
                     continuation.finish()
                 } catch {
                     if await self.isMergeGenerationCurrent(generation) {
-                        log("merge_error \(error)")
+                        log.debug("[SVP][SplitDemux] merge_error \(error)")
                         continuation.finish(throwing: error)
                     } else {
                         continuation.finish()

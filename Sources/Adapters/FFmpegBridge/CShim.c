@@ -478,7 +478,7 @@ void *svp_ffmpeg_demuxer_create(const char *url) {
 
     if (!g_svp_bridge_stamp_printed) {
         g_svp_bridge_stamp_printed = 1;
-        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T18:45\n");
+        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T18:50\n");
     }
 
     avformat_network_init();
@@ -536,7 +536,7 @@ void *svp_ffmpeg_demuxer_create_multi(const char *video_url, const char *audio_u
 
     if (!g_svp_bridge_stamp_printed) {
         g_svp_bridge_stamp_printed = 1;
-        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T18:45\n");
+        fprintf(stderr, "[SVP][FFmpegBridge] build_stamp=SVP_LOCAL_2026-03-13T18:50\n");
     }
 
     avformat_network_init();
