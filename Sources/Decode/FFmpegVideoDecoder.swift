@@ -36,6 +36,7 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         }
 
         let bytestream = BitstreamConverter.toAnnexBIfNeeded(packet.data, codec: packet.formatHint)
+        let dts = packet.dts ?? pts
         let packetSideDataType = packet.sideDataType ?? 0
 
         var rawFrame = svp_ffmpeg_decoded_frame_t()
@@ -48,6 +49,7 @@ public actor FFmpegVideoDecoder: VideoDecoder {
                         bytes.bindMemory(to: UInt8.self).baseAddress,
                         Int32(bytestream.count),
                         pts,
+                        dts,
                         packetSideDataType,
                         sideBytes.bindMemory(to: UInt8.self).baseAddress,
                         Int32(sideData.count),
@@ -62,6 +64,7 @@ public actor FFmpegVideoDecoder: VideoDecoder {
                     bytes.bindMemory(to: UInt8.self).baseAddress,
                     Int32(bytestream.count),
                     pts,
+                    dts,
                     0,
                     nil,
                     0,

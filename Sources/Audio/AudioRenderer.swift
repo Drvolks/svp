@@ -6,7 +6,7 @@ import PlayerCore
 import AVFoundation
 #endif
 
-public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputLifecycle, AudioPlaybackClockProviding, AudioOutputSourceConfigurable {
+public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputLifecycle, AudioPlaybackClockProviding, AudioRenderBufferProviding, AudioOutputSourceConfigurable {
     private struct PlaybackProfile: Sendable {
         let mode: String
         let baseStartBufferSeconds: Double
@@ -23,7 +23,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             startBufferStepOnUnderrun: 0.080,
             rebufferLowWaterSeconds: 0.080,
             lowWaterHitsBeforeRebuffer: 4,
-            maxBufferedAudioSeconds: 2.0
+            maxBufferedAudioSeconds: 0.80
         )
 
         static let live = PlaybackProfile(
@@ -33,7 +33,7 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
             startBufferStepOnUnderrun: 0.080,
             rebufferLowWaterSeconds: 0.050,
             lowWaterHitsBeforeRebuffer: 3,
-            maxBufferedAudioSeconds: 1.40
+            maxBufferedAudioSeconds: 0.55
         )
     }
 
@@ -240,17 +240,28 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
               let playerTime = playerNode.playerTime(forNodeTime: nodeTime) else {
             return lock.withLock { lastDerivedPlaybackPTS }
         }
+        let sampleTime = playerTime.sampleTime
+        if sampleTime < 0 {
+            return lock.withLock { lastDerivedPlaybackPTS ?? anchorPTS }
+        }
         let elapsedSamples = lock.withLock { () -> AVAudioFramePosition in
             if playbackAnchorSampleTime == nil {
-                playbackAnchorSampleTime = max(0, playerTime.sampleTime)
+                playbackAnchorSampleTime = sampleTime
             }
-            let anchorSampleTime = playbackAnchorSampleTime ?? max(0, playerTime.sampleTime)
-            return max(0, playerTime.sampleTime - anchorSampleTime)
+            let anchorSampleTime = playbackAnchorSampleTime ?? sampleTime
+            if sampleTime < anchorSampleTime {
+                playbackAnchorSampleTime = sampleTime
+                return 0
+            }
+            return sampleTime - anchorSampleTime
         }
         let elapsedSeconds = Double(elapsedSamples) / sampleRate
         let playedTime = anchorPTS + CMTime(seconds: elapsedSeconds, preferredTimescale: 90_000)
         let playbackTime = lock.withLock { () -> CMTime in
             if playedTime.isValid {
+                if let lastDerivedPlaybackPTS, playedTime < lastDerivedPlaybackPTS {
+                    return lastDerivedPlaybackPTS
+                }
                 lastDerivedPlaybackPTS = playedTime
                 return playedTime
             }
@@ -270,6 +281,10 @@ public final class AudioRenderer: @unchecked Sendable, AudioOutput, AudioOutputL
         #else
         return nil
         #endif
+    }
+
+    public func bufferedAudioSeconds() -> Double {
+        lock.withLock { queuedBufferSeconds }
     }
 
     public func configure(for descriptor: MediaSourceDescriptor) {

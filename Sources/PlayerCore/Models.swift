@@ -233,6 +233,10 @@ public protocol AudioPlaybackClockProviding: AnyObject, Sendable {
     func currentPlaybackTime() -> CMTime?
 }
 
+public protocol AudioRenderBufferProviding: AnyObject, Sendable {
+    func bufferedAudioSeconds() -> Double
+}
+
 public protocol AudioOutputSourceConfigurable: AnyObject, Sendable {
     func configure(for descriptor: MediaSourceDescriptor)
 }

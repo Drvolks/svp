@@ -9,7 +9,7 @@ import Metal
 import MetalKit
 #endif
 
-public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
+public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput, VideoOutputLifecycle {
     private let lock = NSLock()
     private var lastFramePTS: CMTime = .zero
     private var previousSubmittedPTS: CMTime?
@@ -104,6 +104,38 @@ public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
                 log.debug("[SVP][Render] preferred_fps=\(preferredFPS)")
             }
         }
+        Task { @MainActor [weak self] in
+            guard let self, let view = self.boundView else { return }
+            view.draw()
+        }
+        #endif
+    }
+
+    public func handleDiscontinuity() {
+        lock.lock()
+        lastFramePTS = .zero
+        previousSubmittedPTS = nil
+        recentFrameDurations.removeAll(keepingCapacity: true)
+        submittedFrameCount = 0
+        drawnFrameCount = 0
+        latestSubmittedPTS = .zero
+        lastSubmitUptime = nil
+        lastSubmitPTSForLog = nil
+        currentPreferredFPS = fixedPreferredFPS ?? 60
+        pendingPreferredFPS = nil
+        pendingPreferredFPSHits = 0
+        let nextPreferredFPS = currentPreferredFPS
+        #if canImport(Metal) && canImport(MetalKit) && canImport(CoreImage)
+        latestPixelBuffer = nil
+        #endif
+        lock.unlock()
+
+        #if canImport(Metal) && canImport(MetalKit) && canImport(CoreImage)
+        Task { @MainActor [weak self] in
+            guard let self, let view = self.boundView else { return }
+            view.preferredFramesPerSecond = nextPreferredFPS
+            view.draw()
+        }
         #endif
     }
 
@@ -154,8 +186,8 @@ public final class MetalRenderer: NSObject, @unchecked Sendable, VideoOutput {
 
         view.device = device
         view.framebufferOnly = false
-        view.enableSetNeedsDisplay = false
-        view.isPaused = false
+        view.enableSetNeedsDisplay = true
+        view.isPaused = true
         view.delegate = self
         view.preferredFramesPerSecond = currentPreferredFPS
         view.colorPixelFormat = .bgra8Unorm
@@ -226,21 +258,31 @@ extension MetalRenderer: MTKViewDelegate {
         drawnFrameCount += 1
         let drawnFrameCount = drawnFrameCount
         lock.unlock()
-        guard let pixelBuffer else { return }
-
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
         let drawableSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         let bounds = CGRect(origin: .zero, size: drawableSize)
-        let scaledImage = image.transformed(by: Self.aspectFitTransform(for: image.extent.size, in: drawableSize))
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
 
-        ciContext.render(
-            scaledImage,
-            to: drawable.texture,
-            commandBuffer: commandBuffer,
-            bounds: bounds,
-            colorSpace: colorSpace
-        )
+        let clearPass = MTLRenderPassDescriptor()
+        clearPass.colorAttachments[0].texture = drawable.texture
+        clearPass.colorAttachments[0].loadAction = .clear
+        clearPass.colorAttachments[0].storeAction = .store
+        clearPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+        if let clearEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: clearPass) {
+            clearEncoder.endEncoding()
+        }
+
+        if let pixelBuffer {
+            let image = CIImage(cvPixelBuffer: pixelBuffer)
+            let scaledImage = image.transformed(by: Self.aspectFitTransform(for: image.extent.size, in: drawableSize))
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+            ciContext.render(
+                scaledImage,
+                to: drawable.texture,
+                commandBuffer: commandBuffer,
+                bounds: bounds,
+                colorSpace: colorSpace
+            )
+        }
 
         commandBuffer.present(drawable)
         commandBuffer.commit()

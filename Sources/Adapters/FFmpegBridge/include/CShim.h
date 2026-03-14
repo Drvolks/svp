@@ -82,6 +82,7 @@ int32_t svp_ffmpeg_video_decoder_decode(
     const uint8_t *data,
     int32_t length,
     int64_t pts90k,
+    int64_t dts90k,
     int32_t sideDataType,
     const uint8_t *sideData,
     int32_t sideDataSize,

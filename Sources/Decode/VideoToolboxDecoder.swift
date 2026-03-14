@@ -9,6 +9,7 @@ public actor VideoToolboxDecoder: VideoDecoder {
     private var activeCodec: CodecID?
     private var formatDescription: CMVideoFormatDescription?
     private var session: VTDecompressionSession?
+    private var requiresKeyframeResync = false
 
     private var h264SPS: Data?
     private var h264PPS: Data?
@@ -28,7 +29,7 @@ public actor VideoToolboxDecoder: VideoDecoder {
             log.debug("[SVP] VideoToolboxDecoder.decode: unsupported codec: \(String(describing: packet.formatHint))")
             throw VideoDecodeError.unsupportedCodec(packet.formatHint)
         }
-        guard let ptsValue = packet.pts else {
+        guard packet.pts != nil else {
             log.debug("[SVP] VideoToolboxDecoder.decode: no pts")
             throw VideoDecodeError.needMoreData
         }
@@ -37,23 +38,48 @@ public actor VideoToolboxDecoder: VideoDecoder {
             log.debug("[SVP] VideoToolboxDecoder.decode: codec changed, resetting")
             resetDecoderState()
             activeCodec = packet.formatHint
+            requiresKeyframeResync = false
         }
 
-        // First attempt
+        if requiresKeyframeResync {
+            guard packet.isKeyframe else {
+                log.debug("[SVP] decode: waiting for keyframe resync, dropping inter frame pts=\(packet.pts ?? -1)")
+                throw VideoDecodeError.needsKeyframe
+            }
+            log.debug("[SVP] decode: resyncing decoder on keyframe pts=\(packet.pts ?? -1)")
+            resetDecoderState()
+            requiresKeyframeResync = false
+        }
+
         do {
             return try await decodeFrame(packet)
         } catch let error as VideoDecodeError {
-            // Check if it's a recoverable decode error
             if case .decodeFailed(let status) = error, isRecoverableDecodeError(status) {
-                log.debug("[SVP] decode: recoverable error \(status), resetting session and retrying")
-                // Reset session and retry once
+                if !packet.isKeyframe {
+                    log.debug("[SVP] decode: recoverable error \(status) on inter frame, forcing keyframe resync")
+                    requiresKeyframeResync = true
+                    resetDecoderState()
+                    throw VideoDecodeError.needsKeyframe
+                }
+
+                log.debug("[SVP] decode: recoverable error \(status) on keyframe, resetting session and retrying once")
                 resetDecoderState()
                 do {
                     return try await decodeFrame(packet)
+                } catch let retryError as VideoDecodeError {
+                    if case .decodeFailed(let retryStatus) = retryError {
+                        log.debug("[SVP] decode: keyframe retry failed \(retryStatus), waiting for next keyframe")
+                    } else {
+                        log.debug("[SVP] decode: keyframe retry failed with \(String(describing: retryError)), waiting for next keyframe")
+                    }
+                    requiresKeyframeResync = true
+                    resetDecoderState()
+                    throw VideoDecodeError.needsKeyframe
                 } catch {
-                    // Retry also failed - skip this frame to allow video to continue
-                    log.debug("[SVP] decode: retry failed \(status), skipping frame")
-                    return nil
+                    log.debug("[SVP] decode: keyframe retry failed with unexpected error=\(String(describing: error)), waiting for next keyframe")
+                    requiresKeyframeResync = true
+                    resetDecoderState()
+                    throw VideoDecodeError.needsKeyframe
                 }
             }
             throw error
@@ -92,7 +118,8 @@ public actor VideoToolboxDecoder: VideoDecoder {
             formatDescription: formatDescription,
             pts: pts,
             dts: dts,
-            duration: duration
+            duration: duration,
+            isKeyframe: packet.isKeyframe
         )
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -100,6 +127,8 @@ public actor VideoToolboxDecoder: VideoDecoder {
             let status = VTDecompressionSessionDecodeFrame(
                 session,
                 sampleBuffer: sampleBuffer,
+                // Keep VT internally pipelined; the defensive pixel-buffer copy
+                // and strict keyframe resync handle the corruption case.
                 flags: VTDecodeFrameFlags._EnableAsynchronousDecompression,
                 infoFlagsOut: &infoFlags
             ) { status, _, imageBuffer, presentationTimeStamp, _ in
@@ -111,10 +140,17 @@ public actor VideoToolboxDecoder: VideoDecoder {
                     continuation.resume(throwing: VideoDecodeError.outputUnavailable)
                     return
                 }
+                let ownedPixelBuffer: CVPixelBuffer
+                do {
+                    ownedPixelBuffer = try Self.copyPixelBuffer(imageBuffer)
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
                 continuation.resume(
                     returning: DecodedVideoFrame(
                         pts: presentationTimeStamp,
-                        pixelBuffer: imageBuffer
+                        pixelBuffer: ownedPixelBuffer
                     )
                 )
             }
@@ -135,11 +171,13 @@ public actor VideoToolboxDecoder: VideoDecoder {
         if let session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
         }
+        requiresKeyframeResync = false
         resetDecoderState()
     }
 
     private func resetDecoderState() {
         if let session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
         }
         session = nil
@@ -310,7 +348,8 @@ public actor VideoToolboxDecoder: VideoDecoder {
         formatDescription: CMVideoFormatDescription,
         pts: CMTime,
         dts: CMTime,
-        duration: CMTime
+        duration: CMTime,
+        isKeyframe: Bool
     ) throws -> CMSampleBuffer {
         var blockBuffer: CMBlockBuffer?
         let createBlockStatus = CMBlockBufferCreateWithMemoryBlock(
@@ -361,6 +400,18 @@ public actor VideoToolboxDecoder: VideoDecoder {
         guard createSampleStatus == noErr, let sampleBuffer else {
             throw VideoDecodeError.sampleBufferCreationFailed(createSampleStatus)
         }
+
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) {
+            let dictionaries = attachments as NSArray
+            if let sampleAttachments = dictionaries.firstObject as? NSMutableDictionary {
+                if isKeyframe {
+                    sampleAttachments.removeObject(forKey: kCMSampleAttachmentKey_NotSync)
+                } else {
+                    sampleAttachments[kCMSampleAttachmentKey_NotSync] = kCFBooleanTrue
+                }
+            }
+        }
+
         return sampleBuffer
     }
 
@@ -421,6 +472,77 @@ public actor VideoToolboxDecoder: VideoDecoder {
             throw VideoDecodeError.sessionCreationFailed(status)
         }
         return formatDescription
+    }
+
+    private static func copyPixelBuffer(_ source: CVPixelBuffer) throws -> CVPixelBuffer {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(source)
+        let planeCount = CVPixelBufferGetPlaneCount(source)
+
+        var destination: CVPixelBuffer?
+        let attributes: CFDictionary = [
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferMetalCompatibilityKey: true
+        ] as CFDictionary
+
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            pixelFormat,
+            attributes,
+            &destination
+        )
+        guard status == kCVReturnSuccess, let destination else {
+            throw VideoDecodeError.outputUnavailable
+        }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(destination, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+
+        if planeCount > 0 {
+            for plane in 0..<planeCount {
+                guard let srcBase = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                      let dstBase = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
+                    throw VideoDecodeError.outputUnavailable
+                }
+                let srcBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+                let dstBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(destination, plane)
+                let planeHeight = CVPixelBufferGetHeightOfPlane(source, plane)
+                let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
+
+                memset(dstBase, 0, dstBytesPerRow * planeHeight)
+                for row in 0..<planeHeight {
+                    let srcRow = srcBase.advanced(by: row * srcBytesPerRow)
+                    let dstRow = dstBase.advanced(by: row * dstBytesPerRow)
+                    memcpy(dstRow, srcRow, rowBytes)
+                }
+            }
+        } else {
+            guard let srcBase = CVPixelBufferGetBaseAddress(source),
+                  let dstBase = CVPixelBufferGetBaseAddress(destination) else {
+                throw VideoDecodeError.outputUnavailable
+            }
+            let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+            let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)
+            let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
+
+            memset(dstBase, 0, dstBytesPerRow * height)
+            for row in 0..<height {
+                let srcRow = srcBase.advanced(by: row * srcBytesPerRow)
+                let dstRow = dstBase.advanced(by: row * dstBytesPerRow)
+                memcpy(dstRow, srcRow, rowBytes)
+            }
+        }
+
+        return destination
     }
 }
 
@@ -768,4 +890,3 @@ private enum NALUnitCodec {
         return units
     }
 }
-

@@ -589,7 +589,9 @@ void *svp_ffmpeg_demuxer_create_multi(const char *video_url, const char *audio_u
     demuxer->video_eof = 0;
     demuxer->audio_eof = 0;
     demuxer->pending_video_pts90k = AV_NOPTS_VALUE;
+    demuxer->pending_video_dts = AV_NOPTS_VALUE;
     demuxer->pending_audio_pts90k = AV_NOPTS_VALUE;
+    demuxer->pending_audio_dts = AV_NOPTS_VALUE;
 
     for (i = 0; i < (int32_t)videoFmt->nb_streams; i++) {
         if (videoFmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -945,7 +947,6 @@ int32_t svp_ffmpeg_multi_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_dem
     struct svp_ffmpeg_multi_demuxer *demuxer = (struct svp_ffmpeg_multi_demuxer *)demuxerHandle;
     AVPacket *packet;
     int readStatus;
-    int is_video;
     int64_t video_pts90k;
     int64_t audio_pts90k;
 
@@ -1056,57 +1057,51 @@ int32_t svp_ffmpeg_multi_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_dem
         video_pts90k = demuxer->pending_video_pts90k;
         audio_pts90k = demuxer->pending_audio_pts90k;
 
-        // Output whichever has earlier PTS, not just video first
-        if (video_pts90k != AV_NOPTS_VALUE && audio_pts90k != AV_NOPTS_VALUE) {
-            // Both have data - output the earlier one
-            if (video_pts90k <= audio_pts90k) {
-                is_video = 1;
-                outPacket->streamIndex = 0;
-                outPacket->codecID = demuxer->pending_video_codec;
-                outPacket->pts = demuxer->pending_video_pts90k;
-                outPacket->dts = demuxer->pending_video_pts90k;
-                outPacket->duration = demuxer->pending_video_duration;
-                outPacket->isKeyframe = demuxer->pending_video_keyframe;
-                outPacket->size = demuxer->pending_video_size;
-                outPacket->hasPTS = 1;
-                outPacket->hasDTS = 1;
-                outPacket->hasDuration = demuxer->pending_video_duration > 0 ? 1 : 0;
-                outPacket->data = demuxer->pending_video_data;
-                demuxer->pending_video_data = NULL;
-                demuxer->pending_video_pts90k = AV_NOPTS_VALUE;
-                fprintf(stderr, "[SVP][FFmpegBridge] output_video_packet: pts90k=%lld size=%d keyframe=%d\n",
-                        (long long)outPacket->pts, outPacket->size, outPacket->isKeyframe);
-                av_packet_free(&packet);
-                return 1;
-            } else {
-                is_video = 0;
-                outPacket->streamIndex = 1;
-                outPacket->codecID = demuxer->pending_audio_codec;
-                outPacket->pts = demuxer->pending_audio_pts90k;
-                outPacket->dts = demuxer->pending_audio_pts90k;
-                outPacket->duration = demuxer->pending_audio_duration;
-                outPacket->isKeyframe = 0;
-                outPacket->size = demuxer->pending_audio_size;
-                outPacket->hasPTS = 1;
-                outPacket->hasDTS = 1;
-                outPacket->hasDuration = demuxer->pending_audio_duration > 0 ? 1 : 0;
-                outPacket->data = demuxer->pending_audio_data;
-                demuxer->pending_audio_data = NULL;
-                demuxer->pending_audio_pts90k = AV_NOPTS_VALUE;
-                fprintf(stderr, "[SVP][FFmpegBridge] output_audio_packet: pts90k=%lld size=%d\n",
-                        (long long)outPacket->pts, outPacket->size);
-                av_packet_free(&packet);
-                return 1;
-            }
-        } else {
-            fprintf(stderr, "[SVP][FFmpegBridge] no_packet: video_eof=%d audio_eof=%d video_pts90k=%lld audio_pts90k=%lld\n",
-                    demuxer->video_eof, demuxer->audio_eof,
-                    (long long)demuxer->pending_video_pts90k,
-                    (long long)demuxer->pending_audio_pts90k);
+        // Output whichever packet is ready earliest. If only one side has data, emit it
+        // instead of reporting EOF and starving split A/V playback.
+        if (video_pts90k != AV_NOPTS_VALUE &&
+            (audio_pts90k == AV_NOPTS_VALUE || video_pts90k <= audio_pts90k)) {
+            outPacket->streamIndex = 0;
+            outPacket->codecID = demuxer->pending_video_codec;
+            outPacket->pts = demuxer->pending_video_pts90k;
+            outPacket->dts = demuxer->pending_video_dts;
+            outPacket->duration = demuxer->pending_video_duration;
+            outPacket->isKeyframe = demuxer->pending_video_keyframe;
+            outPacket->size = demuxer->pending_video_size;
+            outPacket->hasPTS = 1;
+            outPacket->hasDTS = demuxer->pending_video_dts != AV_NOPTS_VALUE ? 1 : 0;
+            outPacket->hasDuration = demuxer->pending_video_duration > 0 ? 1 : 0;
+            outPacket->data = demuxer->pending_video_data;
+            demuxer->pending_video_data = NULL;
+            demuxer->pending_video_pts90k = AV_NOPTS_VALUE;
+            demuxer->pending_video_dts = AV_NOPTS_VALUE;
+            fprintf(stderr, "[SVP][FFmpegBridge] output_video_packet: pts90k=%lld size=%d keyframe=%d\n",
+                    (long long)outPacket->pts, outPacket->size, outPacket->isKeyframe);
             av_packet_free(&packet);
-            return 0;
+            return 1;
+        }
+        if (audio_pts90k != AV_NOPTS_VALUE) {
+            outPacket->streamIndex = 1;
+            outPacket->codecID = demuxer->pending_audio_codec;
+            outPacket->pts = demuxer->pending_audio_pts90k;
+            outPacket->dts = demuxer->pending_audio_dts;
+            outPacket->duration = demuxer->pending_audio_duration;
+            outPacket->isKeyframe = 0;
+            outPacket->size = demuxer->pending_audio_size;
+            outPacket->hasPTS = 1;
+            outPacket->hasDTS = demuxer->pending_audio_dts != AV_NOPTS_VALUE ? 1 : 0;
+            outPacket->hasDuration = demuxer->pending_audio_duration > 0 ? 1 : 0;
+            outPacket->data = demuxer->pending_audio_data;
+            demuxer->pending_audio_data = NULL;
+            demuxer->pending_audio_pts90k = AV_NOPTS_VALUE;
+            demuxer->pending_audio_dts = AV_NOPTS_VALUE;
+            fprintf(stderr, "[SVP][FFmpegBridge] output_audio_packet: pts90k=%lld size=%d\n",
+                    (long long)outPacket->pts, outPacket->size);
+            av_packet_free(&packet);
+            return 1;
         }
 
+        av_packet_unref(packet);
         usleep(1000);
     }
 #else
@@ -1760,6 +1755,7 @@ int32_t svp_ffmpeg_video_decoder_decode(
     const uint8_t *data,
     int32_t length,
     int64_t pts90k,
+    int64_t dts90k,
     int32_t sideDataType,
     const uint8_t *sideData,
     int32_t sideDataSize,
@@ -1798,7 +1794,7 @@ int32_t svp_ffmpeg_video_decoder_decode(
     }
     memcpy(packet->data, data, (size_t)length);
     packet->pts = pts90k;
-    packet->dts = pts90k;
+    packet->dts = dts90k != AV_NOPTS_VALUE ? dts90k : pts90k;
     if (sideData != NULL && sideDataSize > 0 && sideDataType > 0) {
         uint8_t *dstSideData = av_packet_new_side_data(
             packet,
@@ -1928,6 +1924,7 @@ int32_t svp_ffmpeg_video_decoder_decode(
     (void)data;
     (void)length;
     (void)pts90k;
+    (void)dts90k;
     (void)sideDataType;
     (void)sideData;
     (void)sideDataSize;

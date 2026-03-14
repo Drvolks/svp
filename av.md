@@ -382,6 +382,144 @@ Résultat attendu:
 Statut:
 - En test.
 
+### 29. Presenter VOD split + faux EOF multi-demux + clear renderer
+
+Hypothèse:
+- Le split YouTube se dégrade à trois endroits distincts:
+  - le bridge FFmpeg multi-input peut signaler EOF alors qu'un seul côté manque momentanément,
+  - le presenter VOD dépile en FIFO sans tenir compte des frames éligibles sur l'horloge audio,
+  - le renderer Metal ne clear pas le drawable avant l'aspect-fit, ce qui peut laisser du "burning".
+
+Changement:
+- `CShim.c`
+  - le multi-demux sort maintenant le paquet vidéo ou audio disponible le plus tôt,
+  - il ne retourne plus EOF tant que les deux côtés ne sont pas réellement terminés.
+- `PlaybackSession.swift`
+  - le split VOD revient à un `preferredLeadSeconds = 0.04`,
+  - le presenter VOD réutilise `popLatestEligible(upTo:)` au lieu d'un FIFO aveugle.
+- `MetalRenderer.swift`
+  - clear explicite du drawable en noir avant le render CoreImage.
+
+Symptôme attendu:
+- Moins de shutter sous livraison bursty du split A/V.
+- Plus de cohérence entre `framePTS` et `audioClock`.
+- Disparition des traces visuelles de frame précédente hors zone effectivement redessinée.
+
+Statut:
+- En test.
+
+### 30. DTS transmis jusqu'au décodeur vidéo FFmpeg
+
+Hypothèse:
+- Le split H.264 continue de shutter parce que le bridge de decode envoie `dts = pts`.
+- Sur un flux avec B-frames, ça casse l'ordre de décodage et peut retarder la première sortie vidéo d'un gros paquet de frames.
+
+Changement:
+- `CShim.h` / `CShim.c`
+  - `svp_ffmpeg_video_decoder_decode(...)` reçoit maintenant `dts90k`.
+- `FFmpegVideoDecoder.swift`
+  - transmet `packet.dts ?? packet.pts` au bridge.
+- `svp_ffmpeg_demuxer_create_multi(...)`
+  - initialise aussi les `pending_*_dts` à `AV_NOPTS_VALUE`.
+
+Symptôme attendu:
+- Première frame vidéo rendue beaucoup plus tôt.
+- Moins de buffering absurde au démarrage.
+- Réduction nette du shutter si la vraie panne venait de l'ordre de décodage H.264.
+
+Statut:
+- En test.
+
+### 31. Backpressure sur le vrai buffer audio renderer
+
+Hypothèse:
+- Le symptôme "avance rapide" ne vient pas d'un `rate` de lecture, mais d'un renderer audio qui accumule beaucoup trop de buffers en sortie.
+- Une fois la queue `AVAudioPlayerNode` montée à ~2s, le pipeline se met à jeter des buffers (`queue_overflow`), ce qui saute du contenu audio et force la vidéo à courir derrière une horloge audio devenue trop optimiste.
+
+Changement:
+- `Models.swift`
+  - ajout d'un protocole `AudioRenderBufferProviding` pour exposer le buffer audio réellement schedulé.
+- `AudioRenderer.swift`
+  - `AudioRenderer` expose `bufferedAudioSeconds()`,
+  - hard cap renderer ramené à `0.80s` en VOD et `0.55s` en live au lieu de ~2s / 1.4s,
+  - `currentPlaybackTime()` ignore les `sampleTime < 0` et ne laisse plus l'horloge repartir en arrière.
+- `PlaybackSession.swift`
+  - `throttleAudioDecodeIfNeeded(...)` se cale d'abord sur le vrai buffer renderer (`0.45s` VOD / `0.30s` live),
+  - puis garde aussi un lead PTS plus serré (`0.30s` VOD).
+
+Symptôme attendu:
+- Disparition des rafales `drop_frame reason=queue_overflow`.
+- Plus de sensation "fast forward" audio/vidéo.
+- Horloge audio plus stable au démarrage et backlog renderer contenu sous ~0.5s au lieu de 2s.
+
+Statut:
+- En test.
+
+### 32. Renderer Metal piloté par les frames, pas par une boucle libre
+
+Hypothèse:
+- Le pacing vidéo est redevenu correct, mais le rendu reste visuellement mauvais parce que `MTKView` tourne en draw loop autonome et n'affiche que le "latest frame" au prochain tick.
+- Résultat probable:
+  - répétition / écrasement de frames selon la cadence du display link,
+  - sensation de shutter malgré une bonne horloge,
+  - contenu précédent conservé lors des discontinuities parce que le renderer ne se reset pas vraiment.
+
+Changement:
+- `MetalRenderer.swift`
+  - `MetalRenderer` implémente maintenant `VideoOutputLifecycle`,
+  - `MTKView` passe en mode manuel (`enableSetNeedsDisplay = true`, `isPaused = true`),
+  - chaque `render(frame:)` déclenche un `view.draw()` sur le main thread,
+  - `handleDiscontinuity()` reset l'état renderer et force un draw vide,
+  - `draw(in:)` clear/present maintenant même sans pixel buffer, donc plus de frame fantôme conservée au changement d'état.
+
+Symptôme attendu:
+- Moins de shutter causé par désalignement entre cadence de submit et cadence de draw.
+- Disparition des frames "brûlées" conservées par le renderer après overwrite/discontinuity.
+- Rendu piloté par les vraies frames présentées, pas par une horloge d'affichage indépendante.
+
+Statut:
+- En test.
+
+### 33. Préférence hardware rétablie pour H.264/HEVC
+
+Hypothèse:
+- Les logs montrent encore un comportement typique du path FFmpeg software (`Reorder`, première frame tardive vers `1.668s`) alors qu'on croit utiliser `preferHardwareDecode = true`.
+- Le vrai bug est dans `DefaultVideoPipeline`: dès qu'un fallback existe, il bypass le primaire et décode tout en software.
+
+Changement:
+- `VideoDecoder.swift`
+  - `DefaultVideoPipeline.decode(packet:)` réutilise maintenant réellement le décodeur primaire,
+  - FFmpeg fallback n'est utilisé que pour:
+    - codecs à bypass explicite (`av1`, `vp9`),
+    - codecs marqués `softwareForcedCodecs` après une erreur primaire compatible,
+  - le reorder buffer reste réservé au path software.
+
+Symptôme attendu:
+- H.264/HEVC repassent sur VideoToolbox quand `preferHardwareDecode = true`.
+- Disparition potentielle du shutter/burning propre au chemin FFmpeg software.
+- Les prochains logs devraient arrêter de ressembler à un pipeline software forcé si le primaire tient.
+
+Statut:
+- En test.
+
+### 34. Copie défensive des pixel buffers VideoToolbox
+
+Hypothèse:
+- Les artefacts restants (smudge sur les mouvements, blocs verts) ressemblent moins à un problème d'horloge qu'à un problème de buffer vidéo réutilisé trop tôt.
+- Le path `VideoToolboxDecoder` renvoyait directement le `CVPixelBuffer` issu de VT, potentiellement recyclé par le pool avant que le renderer n'ait fini de l'afficher.
+
+Changement:
+- `VideoToolboxDecoder.swift`
+  - copie maintenant chaque `CVPixelBuffer` VT dans un nouveau buffer propriétaire avant de le remettre au pipeline,
+  - copie plan par plan avec clear préalable pour éviter tout résidu de lignes/planes précédents.
+
+Symptôme attendu:
+- Réduction nette du "burning"/smudge sur les zones en mouvement.
+- Disparition des blocs verts/corruption globale si la cause était la réutilisation du buffer VT.
+
+Statut:
+- En test.
+
 ### 19. Pacing audio avant render
 
 Hypothèse:
@@ -623,3 +761,110 @@ Changement:
 
 Résultat attendu:
 - AVC1 reste hardware decode (VT) même si AV1/VP9 utilisent software.
+
+### 21. VideoToolbox: resync strict sur keyframe après erreur recoverable
+
+Hypothèse:
+- Le chemin VT continuait à avaler des P/B-frames après `kVTInvalidPictureErr (-8969)`.
+- `reset + retry + skip` sans resync explicite laisse le décodeur repartir au milieu d'un GOP sale.
+- C'est exactement le genre de bricolage qui produit des bavures et des blocs verts "assez valides pour passer".
+
+Changements:
+- `VideoToolboxDecoder` garde maintenant un état `requiresKeyframeResync`.
+- Si VT prend une erreur recoverable sur une inter-frame:
+  - on reset la session,
+  - on bascule en attente de keyframe,
+  - on remonte `VideoDecodeError.needsKeyframe` au lieu de juste `return nil`.
+- Si l'erreur recoverable arrive sur une keyframe:
+  - on retente une seule fois après reset,
+  - si ça échoue encore, on attend explicitement la prochaine keyframe.
+- Les paquets non-keyframe sont rejetés tant que le resync n'a pas été fait.
+- Le sample buffer VT marque maintenant explicitement les inter-frames avec `kCMSampleAttachmentKey_NotSync`.
+- La soumission VT n'utilise plus `_EnableAsynchronousDecompression` ici.
+  - Le pipeline attend déjà frame par frame, donc l'asynchronisme ne faisait qu'ajouter de l'ambiguïté à la récupération et au cycle de vie des buffers.
+
+But:
+- empêcher VT de continuer sur des références mortes après une erreur recoverable,
+- forcer une vraie reprise sur image intra,
+- réduire les artefacts persistants au lieu de juste masquer des échecs decode.
+
+Addendum:
+- Le passage en decode VT strictement synchrone a ensuite révélé un nouveau défaut:
+  - le décodeur ne tenait plus le débit réel du flux,
+  - le presenter finissait par tomber en `queue empty` permanent,
+  - visuellement: vidéo qui part, puis freeze alors que l'audio continue.
+- Correction:
+  - réactivation de `_EnableAsynchronousDecompression`,
+  - tout en gardant:
+    - la copie défensive du `CVPixelBuffer`,
+    - le resync strict sur keyframe après erreur recoverable,
+    - le marquage `NotSync` des inter-frames.
+
+But:
+- récupérer le débit VT sans réintroduire les corruptions qu'on vient d'éliminer.
+
+### 22. Catch-up VOD quand la vidéo tombe derrière l'audio
+
+Constat log:
+- Le renderer ne corrompt plus rien, mais la vidéo finit plusieurs secondes derrière l'audio.
+- Ensuite le presenter droppe chaque frame comme "late" et reste figé sur la dernière image rendue.
+- Continuer à décoder tous les vieux paquets vidéo dans cet état est absurde: on paie le decode, puis on jette tout.
+
+Correction:
+- Ajout d'un rattrapage VOD explicite dans `PlaybackSession`.
+- Si la vidéo a plus de `0.80s` de retard sur l'audio:
+  - on déclenche un `video_catchup_resync`,
+  - on flush le pipeline vidéo,
+  - on purge les queues vidéo paquets + frames,
+  - on repasse en attente de keyframe.
+- Cooldown court (`0.75s`) pour éviter de thrash le pipeline.
+
+But:
+- arrêter de décoder des frames déjà condamnées,
+- permettre au demux/decode de sauter l'historique vidéo périmé,
+- repartir sur une keyframe utile au lieu de finir en freeze permanent.
+
+### 23. `play()` réentrant: double lancement des workers
+
+Constat log:
+- Le même test montrait `handlePlay` deux fois d'affilée.
+- Surtout, `video_decode_loop starting` apparaissait deux fois au démarrage.
+- Ça veut dire que deux workers vidéo lisaient la même `videoPacketQueue` en parallèle.
+
+Cause:
+- `PlaybackSession.play()` est async et faisait un `await startWorkerTasksIfNeeded(...)` avant d'assigner `demuxTask`.
+- Pendant cette fenêtre, un deuxième `play()` pouvait repasser le guard `demuxTask == nil`.
+- Résultat: startup doublé, consommation concurrente des mêmes paquets, keyframes perdues, puis vidéo qui part de travers avant de finir vide/figée.
+
+Correction:
+- Ajout d'un verrou d'intention `playbackStartupInProgress`.
+- `play()` refuse maintenant tout second lancement tant que le premier n'a pas fini d'installer les workers.
+- Après `await startWorkerTasksIfNeeded(...)`, on revalide aussi la `generation` avant d'armer `watchdogTask` et `demuxTask`.
+- Ça évite aussi qu'un `pause()`/`stop` pendant le startup laisse `play()` recréer des tâches zombies juste après.
+
+But:
+- garantir un seul pipeline playback actif par session,
+- empêcher la double consommation de queue au démarrage,
+- stabiliser le chemin VT sans rechanger de backend comme des touristes.
+
+### 24. Ne jamais réordonner les paquets H.264/H.265 côté demux
+
+Constat:
+- Le log split VT était propre côté pacing et presque silencieux côté erreurs decode.
+- Pourtant l'image repartait en pixels verts / burning.
+- `FFmpegDemuxAdapter` gardait encore un buffer local et triait les paquets par `PTS` avant de les livrer.
+
+Pourquoi c'est mauvais:
+- Pour H.264/H.265 avec B-frames, l'ordre utile au décodeur est l'ordre demux/decode, pas l'ordre de présentation.
+- Réordonner les paquets en `PTS` avant `VideoToolbox` revient à nourrir le décodeur avec des références dans le mauvais ordre.
+- C'est exactement le genre de sabotage qui peut produire des artefacts visuels violents tout en gardant des logs "propres".
+
+Correction:
+- Suppression du reorder buffer paquet dans `FFmpegDemuxAdapter`.
+- Les paquets sont maintenant yielded dans l'ordre brut de lecture FFmpeg, avec leurs `PTS/DTS` inchangés.
+- Le seul endroit où un reorder a du sens reste la sortie frame du fallback software, pas l'entrée packet du décodeur.
+
+But:
+- arrêter de casser l'ordre de decode des GOP AVC/HEVC,
+- laisser `VideoToolbox` voir les paquets dans l'ordre qu'il attend,
+- éliminer une cause structurelle de blocs verts / smear au lieu de polir les symptômes.

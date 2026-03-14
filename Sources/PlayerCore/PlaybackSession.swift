@@ -33,6 +33,7 @@ public actor PlaybackSession: PlayerEngine {
     private var videoDecodeTask: Task<Void, Never>?
     private var videoPresentTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
+    private var playbackStartupInProgress = false
     private var state: PlaybackState = .idle
     private var videoOutputs: [ObjectIdentifier: any VideoOutput] = [:]
     private var audioOutputs: [ObjectIdentifier: any AudioOutput] = [:]
@@ -74,13 +75,18 @@ public actor PlaybackSession: PlayerEngine {
     private var lastDecodedVideoFramePTS: CMTime?
     private var lastDecodedVideoFrameUptime: TimeInterval?
     private var lastVideoDecodeElapsedMs: Double = 0
+    private var lastVideoCatchUpResyncUptime: TimeInterval = 0
     private let liveAudioPacketBacklogSoftLimitSeconds: Double = 0.45
     private let liveVideoPacketBacklogSoftLimitSeconds: Double = 1.20
     private let liveFrameBacklogSoftLimitSeconds: Double = 0.35
     private let liveVideoDecodeLeadSoftLimitSeconds: Double = 0.18
     private let splitAudioPacketBacklogSoftLimitSeconds: Double = 0.35
     private let liveAudioDecodeLeadSoftLimitSeconds: Double = 0.20
-    private let vodAudioDecodeLeadSoftLimitSeconds: Double = 0.65
+    private let vodAudioDecodeLeadSoftLimitSeconds: Double = 0.30
+    private let liveRenderedAudioSoftLimitSeconds: Double = 0.30
+    private let vodRenderedAudioSoftLimitSeconds: Double = 0.45
+    private let vodVideoCatchUpLagThresholdSeconds: Double = 0.80
+    private let vodVideoCatchUpCooldownSeconds: Double = 0.75
 
     public init(
         clock: MediaClock = MediaClock(),
@@ -116,7 +122,9 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     public func play() async {
-        guard demuxTask == nil else { return }
+        guard demuxTask == nil, !playbackStartupInProgress else { return }
+        playbackStartupInProgress = true
+        defer { playbackStartupInProgress = false }
         if case .ended = state {
             diagnostics.log("play_requested_from_ended -> restart_from_zero")
             do {
@@ -141,6 +149,7 @@ public actor PlaybackSession: PlayerEngine {
         taskGeneration &+= 1
         let generation = taskGeneration
         await startWorkerTasksIfNeeded(generation: generation)
+        guard generation == taskGeneration else { return }
         watchdogTask = Task { [weak self] in
             guard let self else { return }
             await self.monitorForStalls(generation: generation)
@@ -603,10 +612,13 @@ public actor PlaybackSession: PlayerEngine {
         let useLivePresentation = sourceDescriptor?.isLive == true
         if sourceDescriptor?.isLive == true {
             preferredLeadSeconds = 0.08
+        } else if isSplitSourceDescriptor(sourceDescriptor) {
+            // Split A/V VOD needs a light lead only. Larger values make video
+            // run permanently ahead of the audio clock.
+            preferredLeadSeconds = 0.04
         } else {
-            // For VOD (including YouTube), use larger lead to slow down playback
-            // Software decode is slower, so give more buffer to match real-time
-            preferredLeadSeconds = 0.8
+            // Keep some headroom for regular VOD without introducing visible A/V drift.
+            preferredLeadSeconds = 0.10
         }
         videoPresentTask = Task { [weak self] in
             guard let self else { return }
@@ -746,8 +758,19 @@ public actor PlaybackSession: PlayerEngine {
         let leadSoftLimit = sourceDescriptor?.isLive == true
             ? liveAudioDecodeLeadSoftLimitSeconds
             : vodAudioDecodeLeadSoftLimitSeconds
+        let renderBufferSoftLimit = sourceDescriptor?.isLive == true
+            ? liveRenderedAudioSoftLimitSeconds
+            : vodRenderedAudioSoftLimitSeconds
 
         while !Task.isCancelled && isGenerationCurrent(generation) {
+            if let bufferedAudioSeconds = currentBufferedAudioSeconds() {
+                let excessBufferedSeconds = bufferedAudioSeconds - renderBufferSoftLimit
+                if excessBufferedSeconds > 0.01 {
+                    let boundedSleep = min(0.02, excessBufferedSeconds)
+                    try await Task.sleep(nanoseconds: UInt64(boundedSleep * 1_000_000_000))
+                    continue
+                }
+            }
             guard let playbackClock = currentAudioClockForPresentation(allowDecodeFallback: false),
                   playbackClock.isValid else {
                 return
@@ -760,6 +783,15 @@ public actor PlaybackSession: PlayerEngine {
             let boundedSleep = min(0.02, sleepSeconds)
             try await Task.sleep(nanoseconds: UInt64(boundedSleep * 1_000_000_000))
         }
+    }
+
+    private func currentBufferedAudioSeconds() -> Double? {
+        for output in audioOutputs.values {
+            if let provider = output as? any AudioRenderBufferProviding {
+                return provider.bufferedAudioSeconds()
+            }
+        }
+        return nil
     }
 
     private func throttleLiveDecodedVideoIfNeeded(framePTS: CMTime) async throws {
@@ -788,13 +820,17 @@ public actor PlaybackSession: PlayerEngine {
         await maybeFinishPlaybackAfterDrain()
     }
 
-    private func shouldDropLateVideoFrameAsync(_ framePTS: CMTime) -> Bool {
+    private func shouldDropLateVideoFrameAsync(_ framePTS: CMTime) async -> Bool {
         guard framePTS.isValid,
               let audioPTS = currentAudioClockForPresentation(),
               audioPTS.isValid else {
             return false
         }
         let lagSeconds = (audioPTS - framePTS).seconds
+        if sourceDescriptor?.isLive != true,
+           lagSeconds > vodVideoCatchUpLagThresholdSeconds {
+            await requestVideoCatchUpResyncIfNeeded(framePTS: framePTS, audioPTS: audioPTS, lagSeconds: lagSeconds)
+        }
         let shouldDrop: Bool
         if sourceDescriptor?.isLive == true {
             shouldDrop = lagSeconds > 0.200
@@ -806,6 +842,32 @@ public actor PlaybackSession: PlayerEngine {
             log.debug("[SVP] shouldDropLateVideoFrame: framePTS=\(framePTS.seconds) audioPTS=\(audioPTS.seconds) lag=\(lagSeconds) -> DROP")
         }
         return shouldDrop
+    }
+
+    private func requestVideoCatchUpResyncIfNeeded(
+        framePTS: CMTime,
+        audioPTS: CMTime,
+        lagSeconds: Double
+    ) async {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastVideoCatchUpResyncUptime >= vodVideoCatchUpCooldownSeconds else { return }
+        lastVideoCatchUpResyncUptime = now
+
+        diagnostics.log(
+            "video_catchup_resync framePTS=\(String(format: "%.3f", framePTS.seconds)) " +
+            "audioPTS=\(String(format: "%.3f", audioPTS.seconds)) lag=\(String(format: "%.3f", lagSeconds))"
+        )
+
+        waitingForVideoKeyframeResync = true
+        lastRenderedVideoPTS = nil
+        lastRenderedVideoUptime = nil
+        lastDecodedVideoFramePTS = nil
+        lastDecodedVideoFrameUptime = nil
+
+        await videoPipeline.flush()
+        await videoPacketQueue.reset()
+        await videoFrameQueue.reset()
+        await videoPresenter.handleDiscontinuity()
     }
 
     private func currentAudioClockForPresentation(allowDecodeFallback: Bool = true) -> CMTime? {
@@ -835,6 +897,7 @@ public actor PlaybackSession: PlayerEngine {
     }
 
     private func resetRuntimeState() async {
+        playbackStartupInProgress = false
         packetCount = 0
         droppedVideoPackets = 0
         demuxCompleted = false
@@ -861,6 +924,7 @@ public actor PlaybackSession: PlayerEngine {
         lastDecodedVideoFramePTS = nil
         lastDecodedVideoFrameUptime = nil
         lastVideoDecodeElapsedMs = 0
+        lastVideoCatchUpResyncUptime = 0
         await audioPacketQueue.reset()
         await videoPacketQueue.reset()
         await videoFrameQueue.reset()
@@ -1058,24 +1122,30 @@ private actor VideoPresenter {
         while !Task.isCancelled {
             let frame: DecodedVideoFrame
             if let masterClock = await masterClockProvider(), masterClock.isValid {
-                // Use simple FIFO dequeue for smooth playback instead of popLatestEligible
-                // which can cause stuttering by aggressively skipping frames
-                let snapshot = await frameQueue.snapshot()
                 let lead = max(0.04, preferredLeadSeconds)
                 let maxPTS = masterClock + CMTime(seconds: lead, preferredTimescale: 90_000)
+                let popResult = await frameQueue.popLatestEligible(upTo: maxPTS)
 
-                // If we have frames, always try to dequeue
-                // Don't wait when video is ahead - just display frames as they come
-                // The wait only makes sense when video is behind and needs to catch up
-                let firstPTS = snapshot.firstPTSSeconds
-                if snapshot.count > 0 {
-                    guard let dequeued = await frameQueue.dequeue() else { break }
-                    frame = dequeued
+                if let eligibleFrame = popResult.frame {
+                    frame = eligibleFrame
                 } else {
-                    // Queue empty, wait for frame
-                    log.debug("[SVP] VideoPresent queue empty, waiting...")
-                    guard let dequeued = await frameQueue.dequeue() else { break }
-                    frame = dequeued
+                    let snapshot = await frameQueue.snapshot()
+                    if snapshot.count == 0 {
+                        log.debug("[SVP] VideoPresent queue empty, waiting...")
+                        guard let dequeued = await frameQueue.dequeue() else { break }
+                        frame = dequeued
+                    } else if let firstPTS = snapshot.firstPTSSeconds {
+                        let waitSeconds = firstPTS - maxPTS.seconds
+                        if waitSeconds > 0.001 {
+                            try? await Task.sleep(nanoseconds: UInt64(min(0.010, waitSeconds) * 1_000_000_000))
+                            continue
+                        }
+                        guard let dequeued = await frameQueue.dequeue() else { break }
+                        frame = dequeued
+                    } else {
+                        guard let dequeued = await frameQueue.dequeue() else { break }
+                        frame = dequeued
+                    }
                 }
             } else {
                 guard let dequeued = await frameQueue.dequeue() else { break }

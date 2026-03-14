@@ -111,17 +111,30 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     }
 
     public func decode(packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
-        // Use only FFmpeg for all codecs to avoid VideoToolbox pixel format issues
-        guard let fallback else {
+        guard fallback != nil else {
             return try await primary.decode(packet)
         }
-        if let decoded = try await fallback.decode(packet) {
-            if reorderBuffer[packet.formatHint] == nil {
-                reorderBuffer[packet.formatHint] = FrameReorderBuffer()
-            }
-            return reorderBuffer[packet.formatHint]!.add(decoded)
+
+        let codec = packet.formatHint
+        if shouldUseSoftwareDecoder(for: codec) {
+            return try await decodeWithFallback(packet)
         }
-        return nil
+
+        do {
+            let decoded = try await primary.decode(packet)
+            if decoded != nil {
+                consecutiveSkippedFrameCount[codec] = 0
+            }
+            return decoded
+        } catch {
+            guard shouldForceSoftwareFallback(for: error) else {
+                throw error
+            }
+            softwareForcedCodecs.insert(codec)
+            consecutiveSkippedFrameCount[codec] = 0
+            log.debug("[SVP][VideoPipeline] force_software codec=\(String(describing: codec)) reason=\(String(describing: error))")
+            return try await decodeWithFallback(packet)
+        }
     }
 
     public func flush() async {
@@ -155,5 +168,19 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
             return false
         }
     }
-}
 
+    private func shouldUseSoftwareDecoder(for codec: CodecID) -> Bool {
+        shouldBypassPrimary(for: codec) || softwareForcedCodecs.contains(codec)
+    }
+
+    private func decodeWithFallback(_ packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
+        guard let fallback else { return nil }
+        if let decoded = try await fallback.decode(packet) {
+            if reorderBuffer[packet.formatHint] == nil {
+                reorderBuffer[packet.formatHint] = FrameReorderBuffer()
+            }
+            return reorderBuffer[packet.formatHint]!.add(decoded)
+        }
+        return nil
+    }
+}
