@@ -80,6 +80,8 @@ public struct DemuxedPacket: Sendable {
     public let pts: Int64?
     public let dts: Int64?
     public let duration: Int64?
+    public let codedWidth: Int32?
+    public let codedHeight: Int32?
     public let data: Data
     public let codecConfig: Data?
     public let sideData: Data?
@@ -92,6 +94,8 @@ public struct DemuxedPacket: Sendable {
         pts: Int64?,
         dts: Int64?,
         duration: Int64?,
+        codedWidth: Int32? = nil,
+        codedHeight: Int32? = nil,
         data: Data,
         codecConfig: Data? = nil,
         sideData: Data? = nil,
@@ -103,6 +107,8 @@ public struct DemuxedPacket: Sendable {
         self.pts = pts
         self.dts = dts
         self.duration = duration
+        self.codedWidth = codedWidth
+        self.codedHeight = codedHeight
         self.data = data
         self.codecConfig = codecConfig
         self.sideData = sideData

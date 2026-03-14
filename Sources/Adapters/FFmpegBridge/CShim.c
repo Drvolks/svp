@@ -56,10 +56,13 @@ struct svp_ffmpeg_audio_decoder {
 struct svp_ffmpeg_multi_demuxer {
     AVFormatContext *video_fmt;
     AVFormatContext *audio_fmt;
+    AVBSFContext *video_bsf;
     int32_t video_stream_idx;
     int32_t audio_stream_idx;
     int video_eof;
     int audio_eof;
+    int video_bsf_disabled;
+    int32_t video_bsf_error_count;
     int64_t pending_video_pts90k;
     int64_t pending_video_pts;
     int64_t pending_video_dts;
@@ -68,6 +71,9 @@ struct svp_ffmpeg_multi_demuxer {
     int pending_video_size;
     int32_t pending_video_codec;
     uint8_t *pending_video_data;
+    int32_t pending_video_side_data_type;
+    int32_t pending_video_side_data_size;
+    uint8_t *pending_video_side_data;
     int64_t pending_audio_pts90k;
     int64_t pending_audio_pts;
     int64_t pending_audio_dts;
@@ -346,6 +352,170 @@ static int init_bitstream_filters(struct svp_ffmpeg_demuxer *demuxer) {
     return 0;
 }
 
+static int init_multi_video_bsf(struct svp_ffmpeg_multi_demuxer *demuxer) {
+    AVStream *stream;
+    AVCodecParameters *codecPar;
+    const AVBitStreamFilter *bsf;
+    const char *bsfName;
+    AVBSFContext *bsfCtx = NULL;
+    int ret;
+
+    if (demuxer == NULL || demuxer->video_fmt == NULL || demuxer->video_stream_idx < 0) {
+        return -1;
+    }
+
+    stream = demuxer->video_fmt->streams[demuxer->video_stream_idx];
+    if (stream == NULL || stream->codecpar == NULL) {
+        return -1;
+    }
+
+    codecPar = stream->codecpar;
+    bsfName = bsf_name_for_codec(codecPar->codec_id);
+    if (bsfName == NULL) {
+        return 0;
+    }
+
+    bsf = av_bsf_get_by_name(bsfName);
+    if (bsf == NULL) {
+        fprintf(stderr, "[SVP][Demux] multi_bsf_missing stream=video name=%s\n", bsfName);
+        return 0;
+    }
+
+    ret = av_bsf_alloc(bsf, &bsfCtx);
+    if (ret < 0 || bsfCtx == NULL) {
+        fprintf(stderr, "[SVP][Demux] multi_bsf_alloc_failed name=%s status=%d\n", bsfName, ret);
+        return ret < 0 ? ret : -1;
+    }
+
+    ret = avcodec_parameters_copy(bsfCtx->par_in, codecPar);
+    if (ret < 0) {
+        fprintf(stderr, "[SVP][Demux] multi_bsf_param_copy_failed name=%s status=%d\n", bsfName, ret);
+        av_bsf_free(&bsfCtx);
+        return ret;
+    }
+    bsfCtx->time_base_in = stream->time_base;
+
+    ret = av_bsf_init(bsfCtx);
+    if (ret < 0) {
+        fprintf(stderr, "[SVP][Demux] multi_bsf_init_failed name=%s status=%d\n", bsfName, ret);
+        av_bsf_free(&bsfCtx);
+        return ret;
+    }
+
+    demuxer->video_bsf = bsfCtx;
+    demuxer->video_bsf_disabled = 0;
+    demuxer->video_bsf_error_count = 0;
+    fprintf(stderr, "[SVP][Demux] multi_bsf_enabled stream=video codec=%d name=%s\n", (int)codecPar->codec_id, bsfName);
+    return 0;
+}
+
+static int filter_multi_video_packet_if_needed(struct svp_ffmpeg_multi_demuxer *demuxer, AVPacket *packet) {
+    AVPacket input;
+    AVPacket drained;
+    AVPacket filtered;
+    int ret;
+    int inputSent = 0;
+    int haveDrained = 0;
+
+    if (demuxer == NULL || packet == NULL || demuxer->video_bsf == NULL || demuxer->video_bsf_disabled) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_ffmpeg_demux_mutex);
+    memset(&input, 0, sizeof(input));
+    if (av_packet_ref(&input, packet) < 0) {
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        return 0;
+    }
+    memset(&drained, 0, sizeof(drained));
+    memset(&filtered, 0, sizeof(filtered));
+
+    while (!inputSent) {
+        ret = av_bsf_send_packet(demuxer->video_bsf, &input);
+        if (ret == 0) {
+            inputSent = 1;
+            break;
+        }
+        if (ret == AVERROR(EAGAIN)) {
+            ret = av_bsf_receive_packet(demuxer->video_bsf, &filtered);
+            if (ret >= 0) {
+                if (!haveDrained) {
+                    av_packet_move_ref(&drained, &filtered);
+                    haveDrained = 1;
+                } else {
+                    av_packet_unref(&filtered);
+                }
+                memset(&filtered, 0, sizeof(filtered));
+                continue;
+            }
+            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                demuxer->video_bsf_error_count += 1;
+                if (demuxer->video_bsf_error_count == 1 || demuxer->video_bsf_error_count % 10 == 0) {
+                    fprintf(stderr, "[SVP][Demux] multi_bsf_error stage=drain count=%d status=%d\n", (int)demuxer->video_bsf_error_count, ret);
+                }
+                if (demuxer->video_bsf_error_count >= 3) {
+                    fprintf(stderr, "[SVP][Demux] multi_bsf_disable after_errors=%d\n", (int)demuxer->video_bsf_error_count);
+                    av_bsf_free(&demuxer->video_bsf);
+                    demuxer->video_bsf_disabled = 1;
+                }
+                av_packet_unref(&input);
+                pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+                return ret;
+            }
+            break;
+        }
+        demuxer->video_bsf_error_count += 1;
+        if (demuxer->video_bsf_error_count == 1 || demuxer->video_bsf_error_count % 10 == 0) {
+            fprintf(stderr, "[SVP][Demux] multi_bsf_error stage=send count=%d status=%d\n", (int)demuxer->video_bsf_error_count, ret);
+        }
+        if (demuxer->video_bsf_error_count >= 3) {
+            fprintf(stderr, "[SVP][Demux] multi_bsf_disable after_errors=%d\n", (int)demuxer->video_bsf_error_count);
+            av_bsf_free(&demuxer->video_bsf);
+            demuxer->video_bsf_disabled = 1;
+        }
+        av_packet_unref(&input);
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        return ret;
+    }
+
+    if (haveDrained) {
+        av_packet_unref(packet);
+        av_packet_move_ref(packet, &drained);
+        av_packet_unref(&drained);
+        demuxer->video_bsf_error_count = 0;
+        av_packet_unref(&input);
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        return 0;
+    }
+
+    ret = av_bsf_receive_packet(demuxer->video_bsf, &filtered);
+    if (ret >= 0) {
+        av_packet_unref(packet);
+        av_packet_move_ref(packet, &filtered);
+        demuxer->video_bsf_error_count = 0;
+        av_packet_unref(&input);
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        return 0;
+    }
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        av_packet_unref(&input);
+        pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+        return ret;
+    }
+    demuxer->video_bsf_error_count += 1;
+    if (demuxer->video_bsf_error_count == 1 || demuxer->video_bsf_error_count % 10 == 0) {
+        fprintf(stderr, "[SVP][Demux] multi_bsf_error stage=receive count=%d status=%d\n", (int)demuxer->video_bsf_error_count, ret);
+    }
+    if (demuxer->video_bsf_error_count >= 3) {
+        fprintf(stderr, "[SVP][Demux] multi_bsf_disable after_errors=%d\n", (int)demuxer->video_bsf_error_count);
+        av_bsf_free(&demuxer->video_bsf);
+        demuxer->video_bsf_disabled = 1;
+    }
+    av_packet_unref(&input);
+    pthread_mutex_unlock(&g_ffmpeg_demux_mutex);
+    return ret;
+}
+
 static int filter_packet_if_needed(struct svp_ffmpeg_demuxer *demuxer, AVPacket *packet) {
     AVBSFContext *bsf;
     AVPacket input;
@@ -592,6 +762,8 @@ void *svp_ffmpeg_demuxer_create_multi(const char *video_url, const char *audio_u
     demuxer->pending_video_dts = AV_NOPTS_VALUE;
     demuxer->pending_audio_pts90k = AV_NOPTS_VALUE;
     demuxer->pending_audio_dts = AV_NOPTS_VALUE;
+    demuxer->pending_video_side_data_type = 0;
+    demuxer->pending_video_side_data_size = 0;
 
     for (i = 0; i < (int32_t)videoFmt->nb_streams; i++) {
         if (videoFmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -610,6 +782,20 @@ void *svp_ffmpeg_demuxer_create_multi(const char *video_url, const char *audio_u
     if (demuxer->video_stream_idx < 0 || demuxer->audio_stream_idx < 0) {
         avformat_close_input(&videoFmt);
         avformat_close_input(&audioFmt);
+        free(demuxer);
+        return NULL;
+    }
+
+    if (init_multi_video_bsf(demuxer) < 0) {
+        if (demuxer->video_fmt != NULL) {
+            avformat_close_input(&demuxer->video_fmt);
+        }
+        if (demuxer->audio_fmt != NULL) {
+            avformat_close_input(&demuxer->audio_fmt);
+        }
+        if (demuxer->video_bsf != NULL) {
+            av_bsf_free(&demuxer->video_bsf);
+        }
         free(demuxer);
         return NULL;
     }
@@ -664,6 +850,8 @@ int32_t svp_ffmpeg_demuxer_stream_info(void *demuxerHandle, int32_t index, svp_f
     outInfo->streamID = stream->id;
     outInfo->streamKind = map_ffmpeg_media_type_to_bridge(codecPar->codec_type);
     outInfo->codecID = map_ffmpeg_codec_to_bridge(codecPar->codec_id);
+    outInfo->width = codecPar->width;
+    outInfo->height = codecPar->height;
     outInfo->timebaseNum = stream->time_base.num;
     outInfo->timebaseDen = stream->time_base.den;
     return 0;
@@ -769,6 +957,8 @@ int32_t svp_ffmpeg_multi_demuxer_stream_info(void *demuxerHandle, int32_t index,
     outInfo->streamID = stream->id;
     outInfo->streamKind = map_ffmpeg_media_type_to_bridge(stream->codecpar->codec_type);
     outInfo->codecID = map_ffmpeg_codec_to_bridge(stream->codecpar->codec_id);
+    outInfo->width = stream->codecpar->width;
+    outInfo->height = stream->codecpar->height;
     outInfo->timebaseNum = stream->time_base.num;
     outInfo->timebaseDen = stream->time_base.den;
     return 0;
@@ -977,10 +1167,15 @@ int32_t svp_ffmpeg_multi_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_dem
                 } else if (readStatus < 0) {
                     demuxer->video_eof = 1;
                     break;
+                } else if ((readStatus = filter_multi_video_packet_if_needed(demuxer, packet)) == AVERROR(EAGAIN)) {
+                    av_packet_unref(packet);
+                    continue;
+                } else if (readStatus < 0) {
+                    av_packet_unref(packet);
+                    continue;
                 } else if (packet->stream_index == demuxer->video_stream_idx) {
                     if (packet->pts != AV_NOPTS_VALUE) {
                         AVStream *video_stream = demuxer->video_fmt->streams[demuxer->video_stream_idx];
-                        fprintf(stderr, "[SVP][FFmpegBridge] VIDEO stream timebase: %d/%d\n", video_stream->time_base.num, video_stream->time_base.den);
                         demuxer->pending_video_pts90k = av_rescale_q(packet->pts, video_stream->time_base, (AVRational){1, 90000});
                         demuxer->pending_video_pts = demuxer->pending_video_pts90k;
                         if (packet->dts != AV_NOPTS_VALUE && packet->dts >= 0) {
@@ -989,30 +1184,51 @@ int32_t svp_ffmpeg_multi_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_dem
                             demuxer->pending_video_dts = demuxer->pending_video_pts90k;
                         }
                         demuxer->pending_video_duration = av_rescale_q(packet->duration, video_stream->time_base, (AVRational){1, 90000});
-                        // Detect keyframe from NAL unit type (for length-prefixed format)
                         int isKeyframe = (packet->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
-                        if (!isKeyframe && packet->size > 4) {
-                            // Check NAL unit type: type 5 = IDR, type 7 = SPS, type 8 = PPS
+                        if (!isKeyframe &&
+                            (video_stream->codecpar->codec_id == AV_CODEC_ID_H264 || video_stream->codecpar->codec_id == AV_CODEC_ID_HEVC) &&
+                            packet->size > 4) {
                             uint8_t firstByte = packet->data[4];
                             uint8_t nalType = firstByte & 0x1F;
-                            fprintf(stderr, "[SVP][FFmpegBridge] NAL_type=%d firstByte=%02x\n", nalType, firstByte);
                             if (nalType == 5 || nalType == 7 || nalType == 8) {
                                 isKeyframe = 1;
                             }
                         }
                         demuxer->pending_video_keyframe = isKeyframe;
-                        fprintf(stderr, "[SVP][FFmpegBridge] read_video_packet: FFmpeg_flags=%d AV_PKT_FLAG_KEY=%d isKeyframe=%d\n",
-                                packet->flags, AV_PKT_FLAG_KEY, isKeyframe);
                         demuxer->pending_video_size = packet->size;
                         demuxer->pending_video_codec = map_ffmpeg_codec_to_bridge(video_stream->codecpar->codec_id);
                         demuxer->pending_video_data = (uint8_t *)malloc((size_t)packet->size);
                         if (demuxer->pending_video_data) {
                             memcpy(demuxer->pending_video_data, packet->data, (size_t)packet->size);
                         }
-                        fprintf(stderr, "[SVP][FFmpegBridge] read_video_packet: pts=%lld dts=%lld pts90k=%lld dts90k=%lld size=%d keyframe=%d\n",
-                                (long long)packet->pts, (long long)packet->dts,
-                                (long long)demuxer->pending_video_pts90k, (long long)demuxer->pending_video_dts,
-                                packet->size, demuxer->pending_video_keyframe);
+                        demuxer->pending_video_side_data_type = 0;
+                        demuxer->pending_video_side_data_size = 0;
+                        if (demuxer->pending_video_side_data != NULL) {
+                            free(demuxer->pending_video_side_data);
+                            demuxer->pending_video_side_data = NULL;
+                        }
+                        if (packet->side_data_elems > 0 && packet->side_data != NULL) {
+                            int j;
+                            const AVPacketSideData *picked = NULL;
+                            for (j = 0; j < packet->side_data_elems; j++) {
+                                const AVPacketSideData *candidate = &packet->side_data[j];
+                                if (candidate->data == NULL || candidate->size <= 0) {
+                                    continue;
+                                }
+                                if (candidate->type == AV_PKT_DATA_NEW_EXTRADATA) {
+                                    picked = candidate;
+                                    break;
+                                }
+                            }
+                            if (picked != NULL && picked->size > 0) {
+                                demuxer->pending_video_side_data = (uint8_t *)malloc((size_t)picked->size);
+                                if (demuxer->pending_video_side_data != NULL) {
+                                    memcpy(demuxer->pending_video_side_data, picked->data, (size_t)picked->size);
+                                    demuxer->pending_video_side_data_size = (int32_t)picked->size;
+                                    demuxer->pending_video_side_data_type = (int32_t)picked->type;
+                                }
+                            }
+                        }
                         break;
                     }
                 }
@@ -1072,11 +1288,15 @@ int32_t svp_ffmpeg_multi_demuxer_read_packet(void *demuxerHandle, svp_ffmpeg_dem
             outPacket->hasDTS = demuxer->pending_video_dts != AV_NOPTS_VALUE ? 1 : 0;
             outPacket->hasDuration = demuxer->pending_video_duration > 0 ? 1 : 0;
             outPacket->data = demuxer->pending_video_data;
+            outPacket->sideDataType = demuxer->pending_video_side_data_type;
+            outPacket->sideDataSize = demuxer->pending_video_side_data_size;
+            outPacket->sideData = demuxer->pending_video_side_data;
             demuxer->pending_video_data = NULL;
+            demuxer->pending_video_side_data = NULL;
             demuxer->pending_video_pts90k = AV_NOPTS_VALUE;
             demuxer->pending_video_dts = AV_NOPTS_VALUE;
-            fprintf(stderr, "[SVP][FFmpegBridge] output_video_packet: pts90k=%lld size=%d keyframe=%d\n",
-                    (long long)outPacket->pts, outPacket->size, outPacket->isKeyframe);
+            demuxer->pending_video_side_data_type = 0;
+            demuxer->pending_video_side_data_size = 0;
             av_packet_free(&packet);
             return 1;
         }
@@ -1123,8 +1343,14 @@ void svp_ffmpeg_multi_demuxer_destroy(void *demuxerHandle) {
     if (demuxer->audio_fmt != NULL) {
         avformat_close_input(&demuxer->audio_fmt);
     }
+    if (demuxer->video_bsf != NULL) {
+        av_bsf_free(&demuxer->video_bsf);
+    }
     if (demuxer->pending_video_data != NULL) {
         free(demuxer->pending_video_data);
+    }
+    if (demuxer->pending_video_side_data != NULL) {
+        free(demuxer->pending_video_side_data);
     }
     if (demuxer->pending_audio_data != NULL) {
         free(demuxer->pending_audio_data);

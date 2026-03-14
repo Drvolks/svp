@@ -31,23 +31,37 @@ extension VideoDecodeError: PlaybackCategorizedError {
 private struct FrameReorderBuffer {
     private var frames: [DecodedVideoFrame] = []
     private let maxSize: Int
+    private let discontinuityGapSeconds: Double
+    private let discontinuityRecoveryHoldSeconds: Double
+    private var recoveryAnchorPTS: Double?
 
     private static let log = Logger(subsystem: "com.drvolks.svp", category: "Reorder")
 
-    init(maxSize: Int = 8) {
+    init(
+        maxSize: Int = 8,
+        discontinuityGapSeconds: Double = 0.5,
+        discontinuityRecoveryHoldSeconds: Double = 1.25
+    ) {
         self.maxSize = maxSize
+        self.discontinuityGapSeconds = discontinuityGapSeconds
+        self.discontinuityRecoveryHoldSeconds = discontinuityRecoveryHoldSeconds
     }
 
     mutating func add(_ frame: DecodedVideoFrame) -> DecodedVideoFrame? {
         let beforeCount = frames.count
         frames.append(frame)
         frames.sort { $0.pts.seconds < $1.pts.seconds }
+        trimDiscontinuityPrefixIfNeeded()
 
         var releasedFrame: DecodedVideoFrame? = nil
 
         // Release frames that are ready (not too far from the earliest pending)
-        if frames.count >= maxSize || isNextFrameReady() {
+        if shouldReleaseNextFrame() {
             releasedFrame = frames.removeFirst()
+            if let recoveryAnchorPTS,
+               releasedFrame?.pts.seconds ?? -.infinity >= recoveryAnchorPTS {
+                self.recoveryAnchorPTS = nil
+            }
         }
 
         let releasedPTS: String
@@ -61,6 +75,44 @@ private struct FrameReorderBuffer {
         Self.log.debug("\(msg)")
 
         return releasedFrame
+    }
+
+    private mutating func trimDiscontinuityPrefixIfNeeded() {
+        guard frames.count >= 2 else { return }
+
+        for index in 1..<frames.count {
+            let previousPTS = frames[index - 1].pts.seconds
+            let currentPTS = frames[index].pts.seconds
+            let gap = currentPTS - previousPTS
+            if gap > discontinuityGapSeconds {
+                let dropped = frames[..<index]
+                let droppedCount = dropped.count
+                let droppedUntilPTS = frames[index - 1].pts.seconds
+                frames.removeFirst(droppedCount)
+                recoveryAnchorPTS = currentPTS
+                let msg =
+                    "[SVP][Reorder] trim_discontinuity dropped=\(droppedCount) " +
+                    "gap=\(String(format: "%.3f", gap)) " +
+                    "keptFrom=\(String(format: "%.3f", currentPTS)) " +
+                    "droppedUntil=\(String(format: "%.3f", droppedUntilPTS))"
+                Self.log.debug("\(msg)")
+                return
+            }
+        }
+    }
+
+    private func shouldReleaseNextFrame() -> Bool {
+        guard !frames.isEmpty else { return false }
+
+        if let recoveryAnchorPTS {
+            let recoveredSpanSeconds = frames.last!.pts.seconds - recoveryAnchorPTS
+            if recoveredSpanSeconds < discontinuityRecoveryHoldSeconds,
+               frames.count < maxSize {
+                return false
+            }
+        }
+
+        return frames.count >= maxSize || isNextFrameReady()
     }
 
     private func isNextFrameReady() -> Bool {
@@ -149,16 +201,6 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
         await fallback?.flush()
     }
 
-    private func shouldBypassPrimary(for codec: CodecID) -> Bool {
-        guard preferHardware else { return false }
-        switch codec {
-        case .av1, .vp9:
-            return true
-        default:
-            return false
-        }
-    }
-
     private func shouldForceSoftwareFallback(for error: Error) -> Bool {
         guard let decodeError = error as? VideoDecodeError else { return true }
         switch decodeError {
@@ -170,7 +212,7 @@ public actor DefaultVideoPipeline: PlayerCore.VideoPipeline {
     }
 
     private func shouldUseSoftwareDecoder(for codec: CodecID) -> Bool {
-        shouldBypassPrimary(for: codec) || softwareForcedCodecs.contains(codec)
+        softwareForcedCodecs.contains(codec)
     }
 
     private func decodeWithFallback(_ packet: DemuxedPacket) async throws -> DecodedVideoFrame? {

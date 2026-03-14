@@ -868,3 +868,57 @@ But:
 - arrêter de casser l'ordre de decode des GOP AVC/HEVC,
 - laisser `VideoToolbox` voir les paquets dans l'ordre qu'il attend,
 - éliminer une cause structurelle de blocs verts / smear au lieu de polir les symptômes.
+
+### 25. Ne plus bypasser VideoToolbox par codec
+
+Demande:
+- arrêter le hardcoding "AV1/VP9 -> software direct".
+- laisser le primaire VT tenter sa chance, puis fallback software seulement s'il ne sait pas suivre.
+
+Changements:
+- suppression du bypass codec dans `DefaultVideoPipeline`.
+- ajout du transport `width/height` depuis le demux FFmpeg jusqu'à `DemuxedPacket`.
+- `VideoToolboxDecoder` peut maintenant tenter un `CMVideoFormatDescriptionCreate(...)` générique pour `AV1` et `VP9` à partir des dimensions du stream.
+- le fallback software reste le plan B si VT remonte un échec de capacité/session.
+
+But:
+- laisser le runtime décider au lieu d'un `switch` paresseux,
+- permettre d'observer le vrai comportement VT sur AV1/VP9,
+- préparer un fallback software plus honnête sans politique codée au marqueur.
+
+### 26. AV1 software decode split: appliquer le BSF aussi en multi-demux
+
+Constat log:
+- En AV1 1440p split, VT est bien tenté puis échoue vite avec `sessionCreationFailed(-12906)`.
+- Le fallback software FFmpeg/dav1d démarre, rend quelques secondes, puis enchaîne les `drop_invalid_packet codec=av1 status=-1094995529`.
+- Ce pattern sent le flux mal préparé, pas juste "le CPU rame".
+
+Cause probable:
+- Le demux simple appliquait déjà le BSF `av1_frame_merge`.
+- Le chemin `open_demux_multi` utilisé pour le split A/V ne l'appliquait pas au flux vidéo.
+- En plus, le side data `AV_PKT_DATA_NEW_EXTRADATA` n'était pas propagé dans ce chemin multi.
+
+Correction:
+- ajout d'un BSF vidéo dédié au `svp_ffmpeg_multi_demuxer` pour les codecs qui en ont besoin, notamment AV1.
+- application du filtre sur chaque paquet vidéo lu dans le chemin multi.
+- propagation du side data `NEW_EXTRADATA` jusqu'au paquet sortant.
+- retrait de l'heuristique keyframe basée sur les NAL H264/HEVC pour les autres codecs.
+
+But:
+- nourrir le decodeur software AV1 avec des paquets valides et dans le bon format,
+- arrêter les rafales `INVALIDDATA` qui provoquent les freezes/reprises,
+- corriger le vrai chemin split utilisé par le test, pas un cousin plus propre mais hors sujet.
+
+- 27) 2026-03-14 4K AV1 software decode: made FFmpeg INVALIDDATA handling less trigger-happy by resetting consecutive invalid-drop streaks on accepted packets with no output, and raising the fatal streak threshold for AV1 from 8 to 32 in Sources/Decode/FFmpegVideoDecoder.swift. This avoids brief AV1 packet-corruption bursts turning into full playback resync/freeze cycles.
+
+- 28) 2026-03-14 AV1 software reorder recovery: taught the FrameReorderBuffer in Sources/Decode/VideoDecoder.swift to detect large PTS discontinuities (>0.5s) and drop the stale prefix before the gap. This prevents old pre-stall frames from being released after decode resumes, which was causing long post-freeze catch-up drops on 4K AV1.
+
+- 29) 2026-03-14 AV1 discontinuity smoothing: after a large PTS gap, the FrameReorderBuffer now holds recovered frames for up to 0.5s of continuous media before releasing them. This lets it discard tiny post-gap "islands" if another discontinuity follows immediately, reducing back-to-back freezes into a single cleaner jump.
+
+- 30) 2026-03-14 AV1 discontinuity hold tuning: raised the post-gap recovery hold in Sources/Decode/VideoDecoder.swift from 0.5s to 1.25s. The prior value still allowed a short 5.539-5.873 island to leak out before a second gap at 7.007, producing two back-to-back freezes instead of one cleaner jump.
+
+- 31) 2026-03-14 AV1 software config-change handling: FFmpegVideoDecoder now treats AV_PKT_DATA_NEW_EXTRADATA as a real decoder configuration update. It recreates/retargets the decoder using the new extradata for that packet and stops forwarding the same side data redundantly into the C bridge. This targets the deterministic 3s-7s AV1 failure window where software decode likely crossed a stream config boundary with stale decoder state.
+
+- 32) 2026-03-14 Multi-demux side data propagation fix: FFmpegDemuxAdapter.makePacketStream() was copying only packet payload bytes from the C multi-demux bridge and silently dropping `sideData`/`sideDataType` before building `DemuxedPacket`. That meant split A/V playback could never surface `AV_PKT_DATA_NEW_EXTRADATA` to FFmpegVideoDecoder even when CShim propagated it correctly. The adapter now preserves side data for multi-input packets so AV1 software decode can finally observe real mid-stream config updates instead of debugging a lie.
+
+- 33) 2026-03-14 Multi-demux AV1 BSF packet-loss fix: `filter_multi_video_packet_if_needed()` in Sources/Adapters/FFmpegBridge/CShim.c was mishandling `av_bsf_send_packet(...)=EAGAIN`. It drained one already-filtered packet and returned immediately without retrying the current input packet, effectively dropping video packets whenever the AV1 bitstream filter had backpressure. The logic now mirrors the single-input BSF path: drain one output, keep it aside, retry sending the same input, and only return the drained packet after the current input has actually been accepted by the BSF.

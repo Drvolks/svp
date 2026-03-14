@@ -6,6 +6,10 @@ import OSLog
 import PlayerCore
 
 public actor FFmpegVideoDecoder: VideoDecoder {
+    private static let defaultInvalidPacketDropLimit = 8
+    private static let av1InvalidPacketDropLimit = 32
+    private static let newExtradataSideDataType: Int32 = 1
+
     private let handleBox = FFmpegDecoderHandleBox()
     private var activeCodec: CodecID?
     private var activeCodecConfig: Data?
@@ -30,18 +34,27 @@ public actor FFmpegVideoDecoder: VideoDecoder {
             throw VideoDecodeError.backendUnavailable
         }
 
-        try ensureDecoder(codec: packet.formatHint, codecConfig: packet.codecConfig)
+        let decoderConfig = updatedCodecConfig(for: packet)
+        try ensureDecoder(codec: packet.formatHint, codecConfig: decoderConfig)
         guard let decoderHandle = handleBox.raw else {
             throw VideoDecodeError.backendUnavailable
         }
 
         let bytestream = BitstreamConverter.toAnnexBIfNeeded(packet.data, codec: packet.formatHint)
         let dts = packet.dts ?? pts
-        let packetSideDataType = packet.sideDataType ?? 0
+        let packetSideDataType: Int32
+        let packetSideData: Data?
+        if packet.sideDataType == Self.newExtradataSideDataType {
+            packetSideDataType = 0
+            packetSideData = nil
+        } else {
+            packetSideDataType = packet.sideDataType ?? 0
+            packetSideData = packet.sideData
+        }
 
         var rawFrame = svp_ffmpeg_decoded_frame_t()
         let status: Int32
-        if let sideData = packet.sideData, !sideData.isEmpty {
+        if let sideData = packetSideData, !sideData.isEmpty {
             status = bytestream.withUnsafeBytes { bytes in
                 sideData.withUnsafeBytes { sideBytes in
                     svp_ffmpeg_video_decoder_decode(
@@ -75,6 +88,9 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         defer { svp_ffmpeg_decoded_frame_release(&rawFrame) }
 
         if status == 0 {
+            // A packet accepted by the decoder, even if it produced no frame yet,
+            // breaks an "invalid packet" streak.
+            consecutiveInvalidPacketDrops = 0
             return nil
         }
         if status < 0 {
@@ -84,7 +100,7 @@ public actor FFmpegVideoDecoder: VideoDecoder {
                 if droppedInvalidPacketCount == 1 || droppedInvalidPacketCount % 25 == 0 {
                     log.debug("[SVP][Decode] drop_invalid_packet codec=\(String(describing: packet.formatHint)) status=\(status) count=\(self.droppedInvalidPacketCount)")
                 }
-                if consecutiveInvalidPacketDrops >= 8 {
+                if consecutiveInvalidPacketDrops >= maxInvalidPacketDropsBeforeFailure(for: packet.formatHint) {
                     // Persistent invalid packets usually indicate we started mid-GOP
                     // or decoder state drifted. Escalate so PlaybackSession can
                     // enter keyframe resync mode and flush stale decode state.
@@ -105,6 +121,25 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         let pixelBuffer = try makePixelBuffer(from: rawFrame)
         let framePTS = CMTime(value: rawFrame.pts90k, timescale: 90_000)
         return DecodedVideoFrame(pts: framePTS, pixelBuffer: pixelBuffer)
+    }
+
+    private func updatedCodecConfig(for packet: DemuxedPacket) -> Data? {
+        guard packet.sideDataType == Self.newExtradataSideDataType,
+              let sideData = packet.sideData,
+              !sideData.isEmpty else {
+            return packet.codecConfig
+        }
+
+        if activeCodecConfig != sideData {
+            let previousSize = activeCodecConfig?.count ?? 0
+            let msg =
+                "[SVP][Decode] new_extradata codec=\(String(describing: packet.formatHint)) " +
+                "pts=\(String(describing: packet.pts)) size=\(sideData.count) previousSize=\(previousSize)"
+            log.debug("\(msg)")
+            consecutiveInvalidPacketDrops = 0
+            droppedInvalidPacketCount = 0
+        }
+        return sideData
     }
 
     public func flush() async {
@@ -133,6 +168,18 @@ public actor FFmpegVideoDecoder: VideoDecoder {
         // AVERROR_INVALIDDATA (FFERRTAG('I','N','D','A')): treat as a dropped/corrupt packet.
         // Escalating this to playback-level resync causes slideshow behavior on split VOD.
         return status == -1094995529
+    }
+
+    private func maxInvalidPacketDropsBeforeFailure(for codec: CodecID) -> Int {
+        switch codec {
+        case .av1:
+            // Split YouTube AV1 regularly trips short INVALIDDATA bursts even while
+            // continuing to decode fine on nearby packets. Let software decode ride
+            // through brief turbulence before forcing a full resync.
+            return Self.av1InvalidPacketDropLimit
+        default:
+            return Self.defaultInvalidPacketDropLimit
+        }
     }
 
     private func ensureDecoder(codec: CodecID, codecConfig: Data?) throws {

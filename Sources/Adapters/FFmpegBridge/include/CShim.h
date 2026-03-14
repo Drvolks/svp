@@ -18,6 +18,8 @@ typedef struct svp_ffmpeg_stream_info {
     int32_t streamID;
     int32_t streamKind;
     int32_t codecID;
+    int32_t width;
+    int32_t height;
     int32_t timebaseNum;
     int32_t timebaseDen;
 } svp_ffmpeg_stream_info_t;

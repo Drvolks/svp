@@ -25,10 +25,6 @@ public actor VideoToolboxDecoder: VideoDecoder {
     public func decode(_ packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
         log.info(">>> VideoToolboxDecoder.decode CALLED for codec=\(String(describing: packet.formatHint)) <<<")
         log.debug("[SVP] VideoToolboxDecoder.decode: START packet.pts=\(packet.pts ?? -1) formatHint=\(String(describing: packet.formatHint)) data.count=\(packet.data.count)\n")
-        guard packet.formatHint == .h264 || packet.formatHint == .hevc else {
-            log.debug("[SVP] VideoToolboxDecoder.decode: unsupported codec: \(String(describing: packet.formatHint))")
-            throw VideoDecodeError.unsupportedCodec(packet.formatHint)
-        }
         guard packet.pts != nil else {
             log.debug("[SVP] VideoToolboxDecoder.decode: no pts")
             throw VideoDecodeError.needMoreData
@@ -87,26 +83,44 @@ public actor VideoToolboxDecoder: VideoDecoder {
     }
 
     private func decodeFrame(_ packet: DemuxedPacket) async throws -> DecodedVideoFrame? {
-        captureParameterSets(from: packet.data, codec: packet.formatHint, isCodecConfig: false)
-        // Also check codecConfig (extradata) for parameter sets
-        log.debug("[SVP] decode: packet.data.count=\(packet.data.count) codecConfig=\(packet.codecConfig?.count ?? 0) hasSPS=\(self.h264SPS != nil) hasPPS=\(self.h264PPS != nil)")
-        if let extradata = packet.codecConfig {
-            // Log first few bytes of extradata to debug format
-            let bytes = [UInt8](extradata.prefix(20))
-            log.debug("[SVP] decode: extradata bytes=\(bytes.map { String(format: "%02x", $0) }.joined(separator: " "))")
-            captureParameterSets(from: extradata, codec: packet.formatHint, isCodecConfig: true)
-            log.debug("[SVP] decode: after extradata hasSPS=\(self.h264SPS != nil) hasPPS=\(self.h264PPS != nil)")
-        } else {
-            log.debug("[SVP] decode: NO codecConfig!")
+        switch packet.formatHint {
+        case .h264, .hevc:
+            captureParameterSets(from: packet.data, codec: packet.formatHint, isCodecConfig: false)
+            log.debug("[SVP] decode: packet.data.count=\(packet.data.count) codecConfig=\(packet.codecConfig?.count ?? 0) hasSPS=\(self.h264SPS != nil) hasPPS=\(self.h264PPS != nil)")
+            if let extradata = packet.codecConfig {
+                let bytes = [UInt8](extradata.prefix(20))
+                log.debug("[SVP] decode: extradata bytes=\(bytes.map { String(format: "%02x", $0) }.joined(separator: " "))")
+                captureParameterSets(from: extradata, codec: packet.formatHint, isCodecConfig: true)
+                log.debug("[SVP] decode: after extradata hasSPS=\(self.h264SPS != nil) hasPPS=\(self.h264PPS != nil)")
+            } else {
+                log.debug("[SVP] decode: NO codecConfig!")
+            }
+        case .av1, .vp9:
+            break
+        default:
+            log.debug("[SVP] VideoToolboxDecoder.decode: unsupported codec: \(String(describing: packet.formatHint))")
+            throw VideoDecodeError.unsupportedCodec(packet.formatHint)
         }
-        try ensureSession(codec: packet.formatHint)
+
+        try ensureSession(
+            codec: packet.formatHint,
+            codedWidth: packet.codedWidth,
+            codedHeight: packet.codedHeight
+        )
         log.debug("[SVP] decode: formatDescription=\(self.formatDescription != nil) session=\(self.session != nil)")
         guard let session, let formatDescription else {
             throw VideoDecodeError.needMoreData
         }
 
-        // Handle both Annex-B and length-prefixed formats from FFmpeg
-        let sampleData = NALUnitCodec.convertToLengthPrefixed(packet.data) ?? packet.data
+        let sampleData: Data
+        switch packet.formatHint {
+        case .h264, .hevc:
+            sampleData = NALUnitCodec.convertToLengthPrefixed(packet.data) ?? packet.data
+        case .av1, .vp9:
+            sampleData = packet.data
+        default:
+            throw VideoDecodeError.unsupportedCodec(packet.formatHint)
+        }
         let first4 = [UInt8](sampleData.prefix(8))
         let first4Hex = first4.map { String(format: "%02x", $0) }.joined(separator: " ")
         log.debug("[SVP] decode: sampleData first8=\(first4Hex) isKeyframe=\(packet.isKeyframe) pts=\(packet.pts ?? -1)")
@@ -278,7 +292,7 @@ public actor VideoToolboxDecoder: VideoDecoder {
         return
     }
 
-    private func ensureSession(codec: CodecID) throws {
+    private func ensureSession(codec: CodecID, codedWidth: Int32?, codedHeight: Int32?) throws {
         if session != nil {
             return
         }
@@ -296,6 +310,16 @@ public actor VideoToolboxDecoder: VideoDecoder {
                 throw VideoDecodeError.needMoreData
             }
             newFormatDescription = try createHEVCFormatDescription(vps: vps, sps: sps, pps: pps)
+        case .av1, .vp9:
+            guard let codedWidth, let codedHeight, codedWidth > 0, codedHeight > 0 else {
+                log.debug("[SVP] ensureSession: missing coded size for codec=\(String(describing: codec))")
+                throw VideoDecodeError.unsupportedCodec(codec)
+            }
+            newFormatDescription = try createGenericFormatDescription(
+                codec: codec,
+                width: codedWidth,
+                height: codedHeight
+            )
         default:
             throw VideoDecodeError.unsupportedCodec(codec)
         }
@@ -472,6 +496,44 @@ public actor VideoToolboxDecoder: VideoDecoder {
             throw VideoDecodeError.sessionCreationFailed(status)
         }
         return formatDescription
+    }
+
+    private func createGenericFormatDescription(
+        codec: CodecID,
+        width: Int32,
+        height: Int32
+    ) throws -> CMVideoFormatDescription {
+        guard let codecType = videoCodecType(for: codec) else {
+            throw VideoDecodeError.unsupportedCodec(codec)
+        }
+        var formatDescription: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: codecType,
+            width: width,
+            height: height,
+            extensions: nil,
+            formatDescriptionOut: &formatDescription
+        )
+        guard status == noErr, let formatDescription else {
+            throw VideoDecodeError.sessionCreationFailed(status)
+        }
+        return formatDescription
+    }
+
+    private func videoCodecType(for codec: CodecID) -> CMVideoCodecType? {
+        switch codec {
+        case .h264:
+            return kCMVideoCodecType_H264
+        case .hevc:
+            return kCMVideoCodecType_HEVC
+        case .av1:
+            return kCMVideoCodecType_AV1
+        case .vp9:
+            return kCMVideoCodecType_VP9
+        default:
+            return nil
+        }
     }
 
     private static func copyPixelBuffer(_ source: CVPixelBuffer) throws -> CVPixelBuffer {

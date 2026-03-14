@@ -99,6 +99,10 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                         let packetHasDTS = rawPacket.hasDTS
                         let packetHasDuration = rawPacket.hasDuration
                         let packetIsKeyframe = rawPacket.isKeyframe
+                        let packetSideDataType = rawPacket.sideDataType
+                        let packetSideDataSize = rawPacket.sideDataSize
+                        let packetSideData: Data? = packetSideDataSize > 0 && rawPacket.sideData != nil
+                            ? Data(bytes: rawPacket.sideData!, count: Int(packetSideDataSize)) : nil
                         svp_ffmpeg_demuxed_packet_release(&rawPacket)
 
                         guard let data = packetData,
@@ -112,7 +116,9 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
                                 hasPTS: packetHasPTS,
                                 hasDTS: packetHasDTS,
                                 hasDuration: packetHasDuration,
-                                isKeyframe: packetIsKeyframe
+                                isKeyframe: packetIsKeyframe,
+                                sideData: packetSideData,
+                                sideDataType: packetSideDataType
                               ) else {
                             continue
                         }
@@ -271,6 +277,8 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             pts: normalizedPTS,
             dts: normalizedDTS,
             duration: rawPacket.hasDuration == 1 ? scaleTo90k(rawPacket.duration, num: timebaseNum, den: timebaseDen) : nil,
+            codedWidth: info?.width,
+            codedHeight: info?.height,
             data: data,
             codecConfig: streamCodecConfigByIndex[rawPacket.streamIndex],
             sideData: packetSideData,
@@ -290,7 +298,9 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
         hasPTS: Int32,
         hasDTS: Int32,
         hasDuration: Int32,
-        isKeyframe: Int32
+        isKeyframe: Int32,
+        sideData: Data?,
+        sideDataType: Int32
     ) -> DemuxedPacket? {
         let info = streamInfoByIndex[streamIndex]
         let streamCodec = mapCodec(info?.codecID ?? 0)
@@ -306,10 +316,12 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             pts: normalizedPTS,
             dts: normalizedDTS,
             duration: hasDuration == 1 ? duration : nil,
+            codedWidth: info?.width,
+            codedHeight: info?.height,
             data: data,
             codecConfig: streamCodecConfigByIndex[streamIndex],
-            sideData: nil,
-            sideDataType: nil,
+            sideData: sideData,
+            sideDataType: sideDataType > 0 ? sideDataType : nil,
             isKeyframe: isKeyframe == 1,
             formatHint: codec
         )
@@ -348,6 +360,8 @@ public actor FFmpegDemuxAdapter: PlayerCore.DemuxEngine {
             pts: normalizedPTS,
             dts: normalizedDTS,
             duration: hasDuration == 1 ? scaleTo90k(duration, num: timebaseNum, den: timebaseDen) : nil,
+            codedWidth: info?.width,
+            codedHeight: info?.height,
             data: packetData,
             codecConfig: streamCodecConfigByIndex[streamIndex],
             sideData: nil,
